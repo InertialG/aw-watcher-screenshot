@@ -19,4 +19,8 @@ impl MonitorImageEvent {
     pub fn image(&self) -> &DynamicImage {
         &self.image
     }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
 }

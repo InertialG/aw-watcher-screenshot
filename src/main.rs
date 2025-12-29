@@ -1,4 +1,5 @@
 mod capture;
+mod storage;
 
 use image::ImageFormat;
 use std::fs;

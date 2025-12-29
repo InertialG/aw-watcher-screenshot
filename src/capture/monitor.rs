@@ -88,14 +88,6 @@ impl SafeMonitor {
         Some(MonitorImageEvent::new(self.id.clone(), image, now))
     }
 
-    pub fn get_monitor(&self) -> Monitor {
-        Monitor::from_point(self.x, self.y).expect("Failed to get monitor from point")
-    }
-
-    pub fn position(&self) -> (i32, i32) {
-        (self.x, self.y)
-    }
-
     pub fn id(&self) -> String {
         self.id.clone()
     }
