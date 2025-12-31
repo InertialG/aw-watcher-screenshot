@@ -5,8 +5,8 @@ use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 use xcap::Monitor;
 
-use super::event::MonitorImageEvent;
 use super::monitor::SafeMonitor;
+use crate::event::MonitorImageEvent;
 
 pub struct Capture {
     consumer: mpsc::Sender<MonitorImageEvent>,

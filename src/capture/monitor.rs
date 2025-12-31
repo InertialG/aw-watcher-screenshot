@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use image::DynamicImage;
 use xcap::Monitor;
 
-use super::event::MonitorImageEvent;
 use super::utils;
+use crate::event::MonitorImageEvent;
 
 pub struct SafeMonitor {
     id: String,

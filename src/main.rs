@@ -1,5 +1,6 @@
 mod capture;
-mod storage;
+mod event;
+mod worker;
 
 use image::ImageFormat;
 use std::fs;
@@ -10,7 +11,7 @@ use tracing_subscriber;
 use uuid::Uuid;
 
 use capture::capture::Capture;
-use capture::event::MonitorImageEvent;
+use event::MonitorImageEvent;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
