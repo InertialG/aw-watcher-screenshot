@@ -1,2 +1,5 @@
 /target
 /cache
+/test_cache
+test_db.sqlite
+aw-watcher-screenshot.db

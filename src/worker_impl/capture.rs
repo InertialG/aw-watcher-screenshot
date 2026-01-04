@@ -8,15 +8,19 @@ use regex::Regex;
 use xcap::{Monitor, Window};
 
 struct MonitorInfo {
-    hash: String,
+    name: String,
+    hash: u32,
     x: i32,
     y: i32,
     last_dhash: Option<u64>,
     last_time: Option<DateTime<Utc>>,
 }
 
+use crate::config::CaptureConfig;
+
 pub struct CaptureProcessor {
     monitor_infos: Vec<MonitorInfo>,
+    config: CaptureConfig,
 }
 
 impl TaskProcessor<CaptureCommand, ImageEvent> for CaptureProcessor {
@@ -28,7 +32,7 @@ impl TaskProcessor<CaptureCommand, ImageEvent> for CaptureProcessor {
                 format!("Failed to capture image from monitor {}", monitor_info.hash)
             })?;
 
-            if should_skip(&capture_res, monitor_info) {
+            if should_skip(&self.config, &capture_res, monitor_info) {
                 continue;
             }
 
@@ -42,14 +46,18 @@ impl TaskProcessor<CaptureCommand, ImageEvent> for CaptureProcessor {
 }
 
 impl CaptureProcessor {
-    pub fn new() -> Result<Self, Error> {
+    pub fn new(config: CaptureConfig) -> Result<Self, Error> {
         let real_monitors = Monitor::all()?;
         let mut monitor_infos = Vec::new();
         for monitor in real_monitors {
             let monitor_info = hash_position(&monitor)?;
             monitor_infos.push(monitor_info);
         }
-        Ok(Self { monitor_infos })
+
+        Ok(Self {
+            monitor_infos,
+            config,
+        })
     }
 }
 
@@ -67,26 +75,31 @@ fn focus_window() -> Result<Option<FocusWindow>, Error> {
     Ok(Some(focus_window))
 }
 
-fn should_skip(image: &DynamicImage, monitor_info: &mut MonitorInfo) -> bool {
+fn should_skip(
+    config: &CaptureConfig,
+    image: &DynamicImage,
+    monitor_info: &mut MonitorInfo,
+) -> bool {
     let dhash = dhash(image);
     let now = Utc::now();
 
     if let Some(last_time) = monitor_info.last_time {
-        // If it's been more than 1 minute, we WANT a capture regardless of similarity.
-        if now - last_time > TimeDelta::try_minutes(1).unwrap() {
+        // Use configured force interval
+        if now - last_time > TimeDelta::try_seconds(config.force_interval_secs as i64).unwrap() {
             monitor_info.last_dhash = Some(dhash);
             monitor_info.last_time = Some(now);
             return false;
         }
 
-        // Rate limit: don't capture more than once every 100ms.
+        // Rate limit check (keeping hardcoded small limit for safety, or could be configurable too, but 100ms is standard debounce)
         if now - last_time < TimeDelta::try_milliseconds(100).unwrap() {
             return true;
         }
     }
 
     if let Some(last_dhash) = monitor_info.last_dhash {
-        if hamming_distance(dhash, last_dhash) < 10 {
+        // Use configured dhash threshold
+        if hamming_distance(dhash, last_dhash) < config.dhash_threshold {
             return true;
         }
     }
@@ -117,10 +130,11 @@ fn hash_position(monitor: &Monitor) -> Result<MonitorInfo, Error> {
     } else {
         safe_name
     };
-    let geometry_fingerprint = format!("{}_{}_{}_{}", width, height, x, y);
+    let geometry_fingerprint = format!("{}_{}_{}_{}_{}", name, width, height, x, y);
     let hash = calculate_crc32(&geometry_fingerprint);
     Ok(MonitorInfo {
-        hash: format!("{}_{}", prefix, hash),
+        name: format!("{}_{}", prefix, hash),
+        hash,
         x,
         y,
         last_dhash: None,
