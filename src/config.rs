@@ -10,6 +10,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub sqlite: SqliteConfig,
     pub s3: Option<S3Config>,
+    pub aw_server: Option<AwServerConfig>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -59,6 +60,25 @@ fn default_region() -> String {
     "auto".to_string()
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct AwServerConfig {
+    pub enabled: bool,
+    #[serde(default = "default_aw_host")]
+    pub host: String,
+    #[serde(default)]
+    pub bucket_id: Option<String>,
+    #[serde(default = "default_pulsetime")]
+    pub pulsetime: f64,
+}
+
+fn default_aw_host() -> String {
+    "http://localhost:5600".to_string()
+}
+
+fn default_pulsetime() -> f64 {
+    30.0
+}
+
 impl Config {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path).context("Failed to read config file")?;
@@ -90,6 +110,7 @@ impl Config {
                     .into_owned(),
             },
             s3: None,
+            aw_server: None,
         }
     }
 }

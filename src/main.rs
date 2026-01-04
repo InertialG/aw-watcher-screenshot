@@ -55,9 +55,10 @@ async fn main() -> Result<(), Error> {
         }
     };
 
+    info!("Config loaded, aw_server: {:?}", config.aw_server);
+
     let capture_processor = worker_impl::capture::CaptureProcessor::new(config.capture.clone())?;
     let cache_processor = worker_impl::cache::ToWebpProcessor::new(config.cache.clone());
-    let sqlite_processor = worker_impl::sqlite::SqliteProcessor::new(config.sqlite.clone());
 
     let (tx0, rx0) = mpsc::channel::<CaptureCommand>(5);
     let (tx1, rx1) = mpsc::channel::<ImageEvent>(10);
@@ -66,11 +67,29 @@ async fn main() -> Result<(), Error> {
 
     let capture_worker = worker::Worker::new("capture".to_string(), capture_processor, rx0, tx1)?;
     let cache_worker = worker::Worker::new("cache".to_string(), cache_processor, rx1, tx2)?;
-    let sqlite_worker = worker::Worker::new("sqlite".to_string(), sqlite_processor, rx2, tx3)?;
+
+    // Metadata storage: use aw-server if enabled, otherwise sqlite
+    let metadata_handle = if let Some(ref aw_config) = config.aw_server {
+        if aw_config.enabled {
+            info!("Using aw-server for metadata storage");
+            let processor = worker_impl::awserver::AwServerProcessor::new(aw_config.clone());
+            let metadata_worker = worker::Worker::new("awserver".to_string(), processor, rx2, tx3)?;
+            metadata_worker.start()
+        } else {
+            info!("aw-server disabled, using SQLite for metadata storage");
+            let processor = worker_impl::sqlite::SqliteProcessor::new(config.sqlite.clone());
+            let metadata_worker = worker::Worker::new("sqlite".to_string(), processor, rx2, tx3)?;
+            metadata_worker.start()
+        }
+    } else {
+        info!("Using SQLite for metadata storage (default)");
+        let processor = worker_impl::sqlite::SqliteProcessor::new(config.sqlite.clone());
+        let metadata_worker = worker::Worker::new("sqlite".to_string(), processor, rx2, tx3)?;
+        metadata_worker.start()
+    };
 
     let capture_handle = capture_worker.start();
     let cache_handle = cache_worker.start();
-    let sqlite_handle = sqlite_worker.start();
 
     // S3 upload processor (optional, based on config)
     let (s3_handle, final_rx) = if let Some(s3_config) = config.s3.clone() {
@@ -112,10 +131,10 @@ async fn main() -> Result<(), Error> {
     });
 
     // Wait for all tasks to complete
-    let (capture_result, cache_result, sqlite_result, periodic_result, drain_result) = tokio::join!(
+    let (capture_result, cache_result, metadata_result, periodic_result, drain_result) = tokio::join!(
         capture_handle,
         cache_handle,
-        sqlite_handle,
+        metadata_handle,
         periodic_task,
         drain_handle
     );
@@ -130,7 +149,7 @@ async fn main() -> Result<(), Error> {
     let results = (
         capture_result,
         cache_result,
-        sqlite_result,
+        metadata_result,
         periodic_result,
         drain_result,
     );
@@ -141,7 +160,7 @@ async fn main() -> Result<(), Error> {
         error!("ToWebp worker joined with error: {}", e);
     }
     if let Err(e) = results.2 {
-        error!("Sqlite worker joined with error: {}", e);
+        error!("Metadata worker joined with error: {}", e);
     }
     if let Err(e) = results.3 {
         error!("Periodic task joined with error: {}", e);

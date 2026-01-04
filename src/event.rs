@@ -21,6 +21,7 @@ pub struct ImageEvent {
     pub id: Uuid,
     pub images: HashMap<String, Arc<DynamicImage>>,
     pub datas: HashMap<String, Arc<WebpImage>>,
+    pub file_paths: HashMap<String, String>, // monitor_id -> local file path
     pub timestamp: DateTime<Utc>,
     pub focus_window: Option<FocusWindow>,
 }
@@ -40,6 +41,7 @@ impl ImageEvent {
             id: Uuid::now_v7(),
             images: HashMap::new(),
             datas: HashMap::new(),
+            file_paths: HashMap::new(),
             timestamp: Utc::now(),
             focus_window: None,
         }

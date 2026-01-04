@@ -50,6 +50,11 @@ impl TaskProcessor<ImageEvent, ImageEvent> for ToWebpProcessor {
             let file_path = cache_path.join(format!("{}--{}.webp", &id, &key));
             fs::write(&file_path, &*webp_bytes)?;
 
+            // Record the local file path
+            event
+                .file_paths
+                .insert(key.clone(), file_path.to_string_lossy().into_owned());
+
             event.add_data(key.clone(), webp_bytes);
         }
 
