@@ -1,76 +1,98 @@
-mod capture;
 mod event;
 mod worker;
+mod worker_impl;
 
-use image::ImageFormat;
-use std::fs;
+use crate::event::{CaptureCommand, ImageEvent};
+use anyhow::{Error, Result};
+use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
+use tokio::time;
 use tracing::{error, info};
 use tracing_subscriber;
-use uuid::Uuid;
-
-use capture::capture::Capture;
-use event::MonitorImageEvent;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+async fn main() -> Result<(), Error> {
+    tracing_subscriber::fmt()
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
 
     info!("Starting capture service...");
 
-    // 1. 准备环境
-    fs::create_dir_all("./images").map_err(|e| {
-        error!("Directory creation failed: {}", e);
-        e
-    })?;
+    let capture_processor = worker_impl::capture::CaptureProcessor::new()?;
+    let cache_processor = worker_impl::cache::ToWebpProcessor::new();
 
-    // 2. 初始化通信管道
-    // stop_tx 用于发送退出信号，tx 用于传递图片
-    let (stop_tx, _) = broadcast::channel::<bool>(1);
-    let (tx, mut rx) = mpsc::channel::<MonitorImageEvent>(100);
+    let (tx0, rx0) = mpsc::channel::<CaptureCommand>(5);
+    let (tx1, rx1) = mpsc::channel::<ImageEvent>(10);
+    let (tx2, rx2) = mpsc::channel::<ImageEvent>(30);
 
-    let saver_handler = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let path = format!("./images/{}.jpg", Uuid::new_v4());
-            tokio::task::spawn_blocking(move || {
-                let rgb_image = event.image().to_rgb8();
-                match rgb_image.save_with_format(&path, ImageFormat::Jpeg) {
-                    Ok(_) => info!("Image saved successfully to {}", path),
-                    Err(e) => info!("Error saving image: {}", e),
+    let capture_worker = worker::Worker::new("capture".to_string(), capture_processor, rx0, tx1)?;
+    let cache_worker = worker::Worker::new("cache".to_string(), cache_processor, rx1, tx2)?;
+
+    let capture_handle = capture_worker.start();
+    let cache_handle = cache_worker.start();
+
+    // 启动一个异步任务，每隔两秒发送一个 ImageEvent 到 tx0
+    // 20秒后或收到 Ctrl+C 后终止
+    let periodic_task = tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(2));
+        let timeout = time::sleep(Duration::from_secs(20));
+        tokio::pin!(timeout);
+
+        info!("Periodic sender started.");
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    info!("Periodic tick: sending CaptureCommand");
+                    let reason = "periodic tick";
+                    if let Err(e) = tx0.send(CaptureCommand::new(reason.to_string())).await {
+                        error!("Failed to send CaptureCommand: {}", e);
+                        break;
+                    }
                 }
-            });
+                _ = &mut timeout => {
+                    info!("20 seconds reached, stopping periodic sender.");
+                    break;
+                }
+                res = signal::ctrl_c() => {
+                    if let Err(e) = res {
+                        error!("Failed to listen for ctrl_c: {}", e);
+                    } else {
+                        info!("Ctrl+C received, stopping periodic sender.");
+                    }
+                    break;
+                }
+            }
         }
-        info!("Saver task finished.");
+        info!("Periodic sender stopped and tx0 dropped.");
     });
 
-    // 4. 初始化并运行捕获器
-    let mut capture = Capture::new(tx.clone(), stop_tx.clone());
-    match capture.run() {
-        Ok(_) => info!("Capture task finished."),
-        Err(e) => error!("Error running capture task: {}", e),
-    };
+    let finish_handler = tokio::spawn(async move {
+        let mut rx2 = rx2;
+        let mut count = 0;
+        while let Some(_) = rx2.recv().await {
+            count += 1;
+            info!("Received ImageEvent, continue...");
+        }
+        info!("Received ImageEvent, finish. {}", count);
+    });
 
-    // 5. 等待退出信号 (Ctrl+C)
-    signal::ctrl_c().await?;
-    info!("Ctrl+C received, shutting down...");
-
-    // 6. 优雅退出流程
-    let _ = stop_tx.send(true); // 通知所有截图任务停止
-
-    // 等待所有截图任务停止
-    capture.wait().await;
-    info!("All capture tasks stopped.");
-
-    // 7. 优雅退出第三步：显式释放掉 main 里的这个 tx
-    // 这一点至关重要！如果不 drop(tx)，rx 会以为还有人可能发消息，从而永远等下去
-    drop(tx);
-
-    // 8. 优雅退出第四步：等待 Saver 处理完管道里的“存货”
-    // 当所有 tx 都被释放，rx.recv() 返回 None，saver_handler 才会自然结束
-    saver_handler.await?;
-    info!("All images saved. Exit clean.");
-
-    info!("All tasks finished. Bye!");
+    let results = tokio::join!(capture_handle, cache_handle, periodic_task, finish_handler);
+    if let Err(e) = results.0 {
+        error!("Capture worker joined with error: {}", e);
+    }
+    if let Err(e) = results.1 {
+        error!("ToWebp worker joined with error: {}", e);
+    }
+    if let Err(e) = results.2 {
+        error!("Periodic task joined with error: {}", e);
+    }
+    if let Err(e) = results.3 {
+        error!("Finish handler joined with error: {}", e);
+    }
     Ok(())
 }

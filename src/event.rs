@@ -1,74 +1,101 @@
-use anyhow::{Context, Result};
+use anyhow::{Error, Result};
 use chrono::{DateTime, Utc};
-use image::{DynamicImage, ImageFormat};
+use image::DynamicImage;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing_subscriber::registry::Data;
-use uuid::{NoContext, Timestamp, Uuid};
+use uuid::Uuid;
+use xcap::Window;
 
-pub struct MonitorImageEvent {
-    monitor_id: String,
-    image: Arc<DynamicImage>,
-    timestamp: DateTime<Utc>,
-    id: u128,
+pub struct CaptureCommand {
+    pub reason: String,
 }
 
-impl MonitorImageEvent {
-    pub fn new(monitor_id: String, image: DynamicImage, timestamp: DateTime<Utc>) -> Self {
-        let id = Uuid::new_v7(Timestamp::from_unix(
-            NoContext,
-            timestamp.timestamp() as u64,
-            timestamp.timestamp_subsec_nanos(),
-        ))
-        .to_u128_le();
-        MonitorImageEvent {
-            monitor_id,
-            image: Arc::new(image),
-            timestamp,
-            id,
-        }
-    }
-
-    pub fn image(&self) -> Arc<DynamicImage> {
-        self.image.clone()
-    }
-
-    pub fn timestamp(&self) -> DateTime<Utc> {
-        self.timestamp
-    }
-
-    pub fn filename(&self) -> String {
-        format!("{}.jpg", self.id)
-    }
-
-    pub fn to_webp(&self) -> Result<Vec<u8>> {
-        // 1. 直接使用原始图片，不再 Resize
-        // 这样保留了 100% 的像素细节，对 VLM 的 OCR 极其友好
-
-        let mut buffer = Vec::new();
-        let mut cursor = std::io::Cursor::new(&mut buffer);
-
-        // 2. 编码为 WebP
-        // 这里的开销主要在编码计算上，不仅保留了画质，逻辑也更简单
-        self.image
-            .write_to(&mut cursor, ImageFormat::WebP)
-            .context("Failed to encode original image to WebP")?;
-
-        Ok(buffer)
+impl CaptureCommand {
+    pub fn new(reason: String) -> Self {
+        Self { reason }
     }
 }
 
-pub struct UploadEvent {
-    pub id: u128,
-    pub data: Vec<u8>,
+pub type WebpImage = Vec<u8>;
+pub struct ImageEvent {
+    pub id: Uuid,
+    pub images: HashMap<String, Arc<DynamicImage>>,
+    pub datas: HashMap<String, Arc<WebpImage>>,
     pub timestamp: DateTime<Utc>,
+    pub focus_window: Option<FocusWindow>,
 }
 
-impl UploadEvent {
-    pub fn new(id: u128, data: Vec<u8>, timestamp: DateTime<Utc>) -> Self {
-        UploadEvent {
-            id,
-            data,
-            timestamp,
+pub struct FocusWindow {
+    pub title: String,
+    pub id: u32,
+    pub app_name: String,
+    pub position: (i32, i32),
+    pub size: (u32, u32),
+    pub current_monitor: u32,
+}
+
+impl ImageEvent {
+    pub fn new() -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            images: HashMap::new(),
+            datas: HashMap::new(),
+            timestamp: Utc::now(),
+            focus_window: None,
         }
+    }
+
+    pub fn set_focus_window(&mut self, focus_window: Option<FocusWindow>) -> &mut Self {
+        self.focus_window = focus_window;
+        self
+    }
+
+    pub fn get_id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn add_image(&mut self, id: String, image: DynamicImage) -> &mut Self {
+        self.images.insert(id, Arc::new(image));
+        self
+    }
+
+    pub fn get_image(&self, id: &str) -> Option<Arc<DynamicImage>> {
+        self.images.get(id).cloned()
+    }
+
+    pub fn get_data(&self, id: &str) -> Option<Arc<WebpImage>> {
+        self.datas.get(id).cloned()
+    }
+
+    pub fn add_data(&mut self, id: String, data: Arc<WebpImage>) -> &mut Self {
+        self.datas.insert(id, data);
+        self
+    }
+
+    pub fn image_iter(&self) -> Vec<(String, Arc<DynamicImage>)> {
+        self.images
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect()
+    }
+
+    pub fn data_iter(&self) -> Vec<(String, Arc<WebpImage>)> {
+        self.datas
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect()
+    }
+}
+
+impl FocusWindow {
+    pub fn new(window: Window) -> Result<Self, Error> {
+        Ok(Self {
+            title: window.title()?,
+            id: window.id()?,
+            app_name: window.app_name()?,
+            position: (window.x()?, window.y()?),
+            size: (window.width()?, window.height()?),
+            current_monitor: window.current_monitor()?.id()?,
+        })
     }
 }
