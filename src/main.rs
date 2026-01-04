@@ -26,7 +26,16 @@ struct Args {
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
 
+    // Initialize tracing with EnvFilter
+    // Default: show info level, but filter out noisy xcap platform errors
+    // Override with RUST_LOG env var, e.g.: RUST_LOG=debug,xcap=off
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,xcap::platform=off"));
+
     tracing_subscriber::fmt()
+        .with_env_filter(filter)
         .with_thread_ids(true)
         .with_thread_names(true)
         .with_file(true)
@@ -63,6 +72,23 @@ async fn main() -> Result<(), Error> {
     let cache_handle = cache_worker.start();
     let sqlite_handle = sqlite_worker.start();
 
+    // S3 upload processor (optional, based on config)
+    let (s3_handle, final_rx) = if let Some(s3_config) = config.s3.clone() {
+        if s3_config.enabled {
+            let (tx4, rx4) = mpsc::channel::<ImageEvent>(30);
+            let s3_processor = worker_impl::s3::S3Processor::new(s3_config);
+            let s3_worker = worker::Worker::new("s3".to_string(), s3_processor, rx3, tx4)?;
+            let handle = s3_worker.start();
+            (Some(handle), rx4)
+        } else {
+            info!("S3 upload disabled in config");
+            (None, rx3)
+        }
+    } else {
+        info!("S3 config not found, skipping S3 upload");
+        (None, rx3)
+    };
+
     let trigger_interval = Duration::from_secs(config.trigger.interval_secs);
     let trigger_timeout = config.trigger.timeout_secs.map(Duration::from_secs);
 
@@ -76,24 +102,37 @@ async fn main() -> Result<(), Error> {
         }
     });
 
-    // We need to keep rx3 open so the pipeline doesn't clog, but we don't need to do anything with the result.
-    // Ideally, we could have a "sink" worker, or just drop the receiver if we don't care about backpressure propagating technically.
-    // But if we drop rx3, the sender tx3 will error, causing sqlite worker to stop.
-    // So we spawn a drain task.
+    // Drain the final output channel to prevent backpressure
     let drain_handle = tokio::spawn(async move {
-        let mut rx3 = rx3;
-        while let Some(_) = rx3.recv().await {
+        let mut rx = final_rx;
+        while let Some(_) = rx.recv().await {
             // drain
         }
         info!("Drain handler stopped.");
     });
 
-    let results = tokio::join!(
+    // Wait for all tasks to complete
+    let (capture_result, cache_result, sqlite_result, periodic_result, drain_result) = tokio::join!(
         capture_handle,
         cache_handle,
         sqlite_handle,
         periodic_task,
         drain_handle
+    );
+
+    // Separately await S3 handle if present
+    if let Some(handle) = s3_handle {
+        if let Err(e) = handle.await {
+            error!("S3 worker joined with error: {}", e);
+        }
+    }
+
+    let results = (
+        capture_result,
+        cache_result,
+        sqlite_result,
+        periodic_result,
+        drain_result,
     );
     if let Err(e) = results.0 {
         error!("Capture worker joined with error: {}", e);

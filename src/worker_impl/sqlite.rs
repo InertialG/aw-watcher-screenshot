@@ -3,7 +3,7 @@ use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
 use rusqlite::Connection;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::info;
 
 pub struct SqliteProcessor {
     db_path: Option<PathBuf>,

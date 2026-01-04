@@ -1,14 +1,14 @@
 use crate::event::ImageEvent;
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
-use image::ImageFormat;
 use std::fs;
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
+use webp::Encoder;
 
 pub struct ToWebpProcessor {
     cache_path: Option<PathBuf>,
+    webp_quality: f32,
 }
 
 impl TaskProcessor<ImageEvent, ImageEvent> for ToWebpProcessor {
@@ -33,15 +33,22 @@ impl TaskProcessor<ImageEvent, ImageEvent> for ToWebpProcessor {
             .context("Cache path not initialized")?;
 
         for (key, image) in event.image_iter() {
-            let mut buffer = Cursor::new(Vec::new());
             let id = event.get_id();
-            image
-                .write_to(&mut buffer, ImageFormat::WebP)
-                .context("Failed to encode image to WebP")?;
-            let webp_bytes = Arc::new(buffer.into_inner());
+
+            // Use webp crate for faster encoding with quality control
+            let encoder = Encoder::from_image(&image)
+                .map_err(|e| anyhow::anyhow!("Failed to create WebP encoder: {}", e))?;
+
+            let webp_data = if self.webp_quality >= 100.0 {
+                encoder.encode_lossless()
+            } else {
+                encoder.encode(self.webp_quality)
+            };
+
+            let webp_bytes = Arc::new(webp_data.to_vec());
 
             let file_path = cache_path.join(format!("{}--{}.webp", &id, &key));
-            fs::write(file_path, &*webp_bytes)?;
+            fs::write(&file_path, &*webp_bytes)?;
 
             event.add_data(key.clone(), webp_bytes);
         }
@@ -55,6 +62,9 @@ use crate::config::CacheConfig;
 impl ToWebpProcessor {
     pub fn new(config: CacheConfig) -> Self {
         let cache_path = Some(PathBuf::from(config.cache_dir));
-        Self { cache_path }
+        Self {
+            cache_path,
+            webp_quality: config.webp_quality as f32,
+        }
     }
 }

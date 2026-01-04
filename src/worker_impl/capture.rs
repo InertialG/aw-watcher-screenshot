@@ -26,7 +26,16 @@ pub struct CaptureProcessor {
 impl TaskProcessor<CaptureCommand, ImageEvent> for CaptureProcessor {
     fn process(&mut self, _event: CaptureCommand) -> Result<ImageEvent, Error> {
         let mut event = ImageEvent::new();
-        let focus_window = focus_window()?;
+
+        // Focus window info is optional - don't fail capture if we can't get it
+        let focus_window = match focus_window() {
+            Ok(fw) => fw,
+            Err(e) => {
+                tracing::warn!("Failed to get focus window info: {:?}", e);
+                None
+            }
+        };
+
         for monitor_info in &mut self.monitor_infos {
             let capture_res = capture(monitor_info.x, monitor_info.y).with_context(|| {
                 format!("Failed to capture image from monitor {}", monitor_info.hash)
