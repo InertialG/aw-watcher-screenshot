@@ -4,7 +4,7 @@ mod trigger;
 mod worker;
 mod worker_impl;
 
-use crate::event::{CaptureCommand, ImageEvent};
+use crate::event::{AwEvent, CaptureCommand, CaptureEvent, CompleteCommand, ImageEvent};
 use anyhow::{Error, Result};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -59,54 +59,24 @@ async fn main() -> Result<(), Error> {
 
     let capture_processor = worker_impl::capture::CaptureProcessor::new(config.capture.clone())?;
     let cache_processor = worker_impl::cache::ToWebpProcessor::new(config.cache.clone());
+    let s3_processor = worker_impl::s3::S3Processor::new(config.s3.clone());
+    let processor = worker_impl::awserver::AwServerProcessor::new(config.aw_server.clone());
 
     let (tx0, rx0) = mpsc::channel::<CaptureCommand>(5);
-    let (tx1, rx1) = mpsc::channel::<ImageEvent>(10);
+    let (tx1, rx1) = mpsc::channel::<CaptureEvent>(10);
     let (tx2, rx2) = mpsc::channel::<ImageEvent>(30);
-    let (tx3, rx3) = mpsc::channel::<ImageEvent>(30);
+    let (tx3, rx3) = mpsc::channel::<AwEvent>(30);
+    let (tx4, rx4) = mpsc::channel::<CompleteCommand>(30);
 
     let capture_worker = worker::Worker::new("capture".to_string(), capture_processor, rx0, tx1)?;
     let cache_worker = worker::Worker::new("cache".to_string(), cache_processor, rx1, tx2)?;
+    let s3_worker = worker::Worker::new("s3".to_string(), s3_processor, rx2, tx3)?;
+    let metadata_worker = worker::Worker::new("awserver".to_string(), processor, rx3, tx4)?;
 
-    // Metadata storage: use aw-server if enabled, otherwise sqlite
-    let metadata_handle = if let Some(ref aw_config) = config.aw_server {
-        if aw_config.enabled {
-            info!("Using aw-server for metadata storage");
-            let processor = worker_impl::awserver::AwServerProcessor::new(aw_config.clone());
-            let metadata_worker = worker::Worker::new("awserver".to_string(), processor, rx2, tx3)?;
-            metadata_worker.start()
-        } else {
-            info!("aw-server disabled, using SQLite for metadata storage");
-            let processor = worker_impl::sqlite::SqliteProcessor::new(config.sqlite.clone());
-            let metadata_worker = worker::Worker::new("sqlite".to_string(), processor, rx2, tx3)?;
-            metadata_worker.start()
-        }
-    } else {
-        info!("Using SQLite for metadata storage (default)");
-        let processor = worker_impl::sqlite::SqliteProcessor::new(config.sqlite.clone());
-        let metadata_worker = worker::Worker::new("sqlite".to_string(), processor, rx2, tx3)?;
-        metadata_worker.start()
-    };
-
+    let aw_handler = metadata_worker.start();
+    let s3_handler = s3_worker.start();
     let capture_handle = capture_worker.start();
     let cache_handle = cache_worker.start();
-
-    // S3 upload processor (optional, based on config)
-    let (s3_handle, final_rx) = if let Some(s3_config) = config.s3.clone() {
-        if s3_config.enabled {
-            let (tx4, rx4) = mpsc::channel::<ImageEvent>(30);
-            let s3_processor = worker_impl::s3::S3Processor::new(s3_config);
-            let s3_worker = worker::Worker::new("s3".to_string(), s3_processor, rx3, tx4)?;
-            let handle = s3_worker.start();
-            (Some(handle), rx4)
-        } else {
-            info!("S3 upload disabled in config");
-            (None, rx3)
-        }
-    } else {
-        info!("S3 config not found, skipping S3 upload");
-        (None, rx3)
-    };
 
     let trigger_interval = Duration::from_secs(config.trigger.interval_secs);
     let trigger_timeout = config.trigger.timeout_secs.map(Duration::from_secs);
@@ -123,33 +93,28 @@ async fn main() -> Result<(), Error> {
 
     // Drain the final output channel to prevent backpressure
     let drain_handle = tokio::spawn(async move {
-        let mut rx = final_rx;
-        while let Some(_) = rx.recv().await {
+        let mut rx4 = rx4;
+        while let Some(_) = rx4.recv().await {
             // drain
         }
         info!("Drain handler stopped.");
     });
 
     // Wait for all tasks to complete
-    let (capture_result, cache_result, metadata_result, periodic_result, drain_result) = tokio::join!(
+    let (capture_result, cache_result, s3_result, aw_result, periodic_result, drain_result) = tokio::join!(
         capture_handle,
         cache_handle,
-        metadata_handle,
+        s3_handler,
+        aw_handler,
         periodic_task,
         drain_handle
     );
 
-    // Separately await S3 handle if present
-    if let Some(handle) = s3_handle {
-        if let Err(e) = handle.await {
-            error!("S3 worker joined with error: {}", e);
-        }
-    }
-
     let results = (
         capture_result,
         cache_result,
-        metadata_result,
+        s3_result,
+        aw_result,
         periodic_result,
         drain_result,
     );
@@ -160,12 +125,15 @@ async fn main() -> Result<(), Error> {
         error!("ToWebp worker joined with error: {}", e);
     }
     if let Err(e) = results.2 {
-        error!("Metadata worker joined with error: {}", e);
+        error!("S3 worker joined with error: {}", e);
     }
     if let Err(e) = results.3 {
-        error!("Periodic task joined with error: {}", e);
+        error!("AWServer worker joined with error: {}", e);
     }
     if let Err(e) = results.4 {
+        error!("Periodic task joined with error: {}", e);
+    }
+    if let Err(e) = results.5 {
         error!("Drain handler joined with error: {}", e);
     }
     Ok(())

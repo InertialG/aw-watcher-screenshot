@@ -1,32 +1,20 @@
-use crate::config::AwServerConfig;
-use crate::event::ImageEvent;
-use crate::worker::TaskProcessor;
-use anyhow::{Context, Error, Result};
-use reqwest::blocking::Client;
-use serde::Serialize;
 use std::collections::HashMap;
-use tracing::{info, warn};
+
+use crate::event::CompleteCommand;
+use crate::worker::TaskProcessor;
+use crate::{config::AwServerConfig, event::AwEvent};
+use anyhow::{Context, Error, Result};
+use aw_client_rust::AwClient;
+use aw_models::Event;
+use chrono::Duration;
+use serde_json::{Map, Value};
 
 pub struct AwServerProcessor {
     config: AwServerConfig,
-    client: Option<Client>,
+    client: Option<AwClient>,
     bucket_id: Option<String>,
-    initialized: bool,
-}
 
-#[derive(Serialize)]
-struct BucketCreate {
-    client: String,
-    #[serde(rename = "type")]
-    bucket_type: String,
-    hostname: String,
-}
-
-#[derive(Serialize)]
-struct HeartbeatEvent {
-    timestamp: String,
-    duration: f64,
-    data: HashMap<String, serde_json::Value>,
+    last_datas: Option<HashMap<String, String>>,
 }
 
 impl AwServerProcessor {
@@ -35,134 +23,86 @@ impl AwServerProcessor {
             config,
             client: None,
             bucket_id: None,
-            initialized: false,
+            last_datas: None,
         }
-    }
-
-    /// Lazy initialization - called on first process() inside spawn_blocking
-    fn ensure_initialized(&mut self) -> Result<(), Error> {
-        if self.initialized {
-            return Ok(());
-        }
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .context("Failed to create HTTP client")?;
-
-        // Get hostname for bucket naming
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "unknown".to_string());
-
-        // Use configured bucket_id or generate default
-        let bucket_id = self
-            .config
-            .bucket_id
-            .clone()
-            .unwrap_or_else(|| format!("aw-watcher-screenshot_{}", hostname));
-
-        // Create bucket if not exists
-        let bucket_url = format!("{}/api/0/buckets/{}", self.config.host, bucket_id);
-
-        let bucket_create = BucketCreate {
-            client: "aw-watcher-screenshot".to_string(),
-            bucket_type: "app.editor.activity".to_string(),
-            hostname: hostname.clone(),
-        };
-
-        let resp = client.post(&bucket_url).json(&bucket_create).send();
-
-        match resp {
-            Ok(r) => {
-                if r.status().is_success() || r.status().as_u16() == 304 {
-                    info!(
-                        "AwServerProcessor initialized with bucket '{}' at {}",
-                        bucket_id, self.config.host
-                    );
-                } else {
-                    warn!(
-                        "Bucket creation returned status {}: {:?}",
-                        r.status(),
-                        r.text().unwrap_or_default()
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to create bucket (aw-server may not be running): {}",
-                    e
-                );
-            }
-        }
-
-        self.client = Some(client);
-        self.bucket_id = Some(bucket_id);
-        self.initialized = true;
-        Ok(())
     }
 }
 
-impl TaskProcessor<ImageEvent, ImageEvent> for AwServerProcessor {
+impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
     fn init(&mut self) -> Result<(), Error> {
-        // Do nothing here - initialization happens lazily in process()
-        // because reqwest::blocking::Client cannot be created in async context
-        info!("AwServerProcessor will initialize on first event (lazy init)");
+        let client = AwClient::new(
+            &self.config.host,
+            &self.config.port.to_string(),
+            &self.config.bucket_id,
+        );
+
+        let bucket_id = format!("{}_{}", self.config.bucket_id, self.config.hostname);
+
+        client
+            .create_bucket(&bucket_id, "uno.guan810.screenshot")
+            .context("Failed to create bucket")?;
+
+        self.client = Some(client);
+        self.bucket_id = Some(bucket_id);
+
         Ok(())
     }
 
-    fn process(&mut self, event: ImageEvent) -> Result<ImageEvent, Error> {
-        // Lazy init on first call (inside spawn_blocking)
-        self.ensure_initialized()?;
+    fn process(&mut self, event: AwEvent) -> Result<CompleteCommand, Error> {
+        let Some(bucket_id) = &self.bucket_id else {
+            return Err(anyhow::anyhow!("Bucket ID not initialized"));
+        };
+        let Some(client) = &self.client else {
+            return Err(anyhow::anyhow!("Client not initialized"));
+        };
 
-        let client = self
-            .client
-            .as_ref()
-            .context("HTTP client not initialized")?;
+        let (timestamp, mut datas) = event.into_parts();
+        let is_empty = datas.is_empty();
 
-        let bucket_id = self
-            .bucket_id
-            .as_ref()
-            .context("Bucket ID not initialized")?;
+        if let Some(last_datas) = &self.last_datas {
+            if !is_empty {
+                let finish = Event {
+                    id: None,
+                    timestamp: timestamp - Duration::milliseconds(1),
+                    duration: Duration::zero(), // TODO：待验证
+                    data: change_datas(&last_datas),
+                };
+                client
+                    .heartbeat(&bucket_id, &finish, 10.0)
+                    .context("Failed to send heartbeat")?;
+            }
 
-        let heartbeat_url = format!(
-            "{}/api/0/buckets/{}/heartbeat?pulsetime={}",
-            self.config.host, bucket_id, self.config.pulsetime
-        );
-
-        // Send one heartbeat per image (per monitor_id)
-        for (monitor_id, local_path) in &event.file_paths {
-            let mut data = HashMap::new();
-            data.insert(
-                "event_id".to_string(),
-                serde_json::json!(event.id.to_string()),
-            );
-            data.insert("monitor_id".to_string(), serde_json::json!(monitor_id));
-            data.insert("local_path".to_string(), serde_json::json!(local_path));
-
-            let heartbeat = HeartbeatEvent {
-                timestamp: event.timestamp.to_rfc3339(),
-                duration: 0.0,
-                data,
-            };
-
-            match client.post(&heartbeat_url).json(&heartbeat).send() {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        warn!(
-                            "Heartbeat failed for monitor {} with status {}: {:?}",
-                            monitor_id,
-                            resp.status(),
-                            resp.text().unwrap_or_default()
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to send heartbeat for monitor {}: {}", monitor_id, e);
+            for (key, value) in last_datas.iter() {
+                if !datas.contains_key(key) {
+                    datas.insert(key.clone(), value.clone());
                 }
             }
-        }
+        } else {
+            if is_empty {
+                return Err(anyhow::anyhow!("Empty datas in first event."));
+            }
+        };
 
-        Ok(event)
+        // 更新 last_datas
+        self.last_datas = Some(datas);
+
+        let heartbeat = Event {
+            id: None,
+            timestamp: timestamp,
+            duration: Duration::zero(),
+            data: change_datas(self.last_datas.as_ref().unwrap()),
+        };
+
+        client
+            .heartbeat(&bucket_id, &heartbeat, 10.0)
+            .context("Failed to send heartbeat")?;
+        Ok(true)
     }
+}
+
+fn change_datas(datas: &HashMap<String, String>) -> Map<String, Value> {
+    datas
+        .into_iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect()
 }

@@ -8,9 +8,8 @@ pub struct Config {
     pub trigger: TriggerConfig,
     pub capture: CaptureConfig,
     pub cache: CacheConfig,
-    pub sqlite: SqliteConfig,
-    pub s3: Option<S3Config>,
-    pub aw_server: Option<AwServerConfig>,
+    pub s3: S3Config,
+    pub aw_server: AwServerConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -39,44 +38,49 @@ fn default_webp_quality() -> u8 {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-pub struct SqliteConfig {
-    pub db_path: String,
-}
-
-#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct S3Config {
     pub enabled: bool,
     pub endpoint: String,
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
-    #[serde(default = "default_region")]
     pub region: String,
-    #[serde(default)]
     pub key_prefix: Option<String>,
 }
 
-fn default_region() -> String {
-    "auto".to_string()
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "".to_string(),
+            bucket: "".to_string(),
+            access_key: "".to_string(),
+            secret_key: "".to_string(),
+            region: "".to_string(),
+            key_prefix: None,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct AwServerConfig {
-    pub enabled: bool,
-    #[serde(default = "default_aw_host")]
     pub host: String,
-    #[serde(default)]
-    pub bucket_id: Option<String>,
-    #[serde(default = "default_pulsetime")]
-    pub pulsetime: f64,
+    pub port: u16,
+    pub bucket_id: String,
+    pub hostname: String,
 }
 
-fn default_aw_host() -> String {
-    "http://localhost:5600".to_string()
-}
-
-fn default_pulsetime() -> f64 {
-    30.0
+impl Default for AwServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "localhost".to_string(),
+            port: 5600,
+            bucket_id: "aw-watcher-screenshot".to_string(),
+            hostname: "unknown".to_string(),
+        }
+    }
 }
 
 impl Config {
@@ -103,14 +107,8 @@ impl Config {
                 cache_dir: exe_dir.join("cache").to_string_lossy().into_owned(),
                 webp_quality: 75,
             },
-            sqlite: SqliteConfig {
-                db_path: exe_dir
-                    .join("aw-watcher-screenshot.db")
-                    .to_string_lossy()
-                    .into_owned(),
-            },
-            s3: None,
-            aw_server: None,
+            s3: S3Config::default(),
+            aw_server: AwServerConfig::default(),
         }
     }
 }

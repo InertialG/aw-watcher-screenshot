@@ -1,4 +1,4 @@
-use crate::event::ImageEvent;
+use crate::event::{CaptureEvent, ImageEvent};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
 use std::fs;
@@ -11,7 +11,7 @@ pub struct ToWebpProcessor {
     webp_quality: f32,
 }
 
-impl TaskProcessor<ImageEvent, ImageEvent> for ToWebpProcessor {
+impl TaskProcessor<CaptureEvent, ImageEvent> for ToWebpProcessor {
     fn init(&mut self) -> Result<(), Error> {
         let cache_path = if let Some(ref path) = self.cache_path {
             path.clone()
@@ -26,16 +26,15 @@ impl TaskProcessor<ImageEvent, ImageEvent> for ToWebpProcessor {
         Ok(())
     }
 
-    fn process(&mut self, mut event: ImageEvent) -> Result<ImageEvent, Error> {
+    fn process(&mut self, event: CaptureEvent) -> Result<ImageEvent, Error> {
         let cache_path = self
             .cache_path
             .as_ref()
             .context("Cache path not initialized")?;
 
-        for (key, image) in event.image_iter() {
-            let id = event.get_id();
+        let mut image_event = ImageEvent::new(event.timestamp);
 
-            // Use webp crate for faster encoding with quality control
+        for (key, image) in event.image_iter() {
             let encoder = Encoder::from_image(&image)
                 .map_err(|e| anyhow::anyhow!("Failed to create WebP encoder: {}", e))?;
 
@@ -47,18 +46,17 @@ impl TaskProcessor<ImageEvent, ImageEvent> for ToWebpProcessor {
 
             let webp_bytes = Arc::new(webp_data.to_vec());
 
-            let file_path = cache_path.join(format!("{}--{}.webp", &id, &key));
+            // Path format: {yyyy/mm/dd}/{hh}/{timestamp}_{device_hash}.webp
+            let file_dir = cache_path.join(event.get_path_subdir());
+            if !file_dir.exists() {
+                fs::create_dir_all(&file_dir)?;
+            }
+            let file_path = file_dir.join(event.get_filename(&key));
             fs::write(&file_path, &*webp_bytes)?;
 
-            // Record the local file path
-            event
-                .file_paths
-                .insert(key.clone(), file_path.to_string_lossy().into_owned());
-
-            event.add_data(key.clone(), webp_bytes);
+            image_event.add_data(key.clone(), webp_bytes);
         }
-
-        Ok(event)
+        Ok(image_event)
     }
 }
 

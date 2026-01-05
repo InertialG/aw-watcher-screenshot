@@ -47,8 +47,7 @@ impl TimerTrigger {
             tokio::select! {
                 _ = interval.tick() => {
                     info!("TimerTrigger tick: sending CaptureCommand");
-                    let reason = "periodic tick";
-                    if let Err(e) = self.tx.send(CaptureCommand::new(reason.to_string())).await {
+                    if let Err(e) = self.tx.send(true).await {
                         error!("Failed to send CaptureCommand: {}", e);
                         break;
                     }

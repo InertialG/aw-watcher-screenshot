@@ -3,5 +3,5 @@
 /test_cache
 test_db.sqlite
 aw-watcher-screenshot.db
-Cargo.lock
 config.toml
+Cargo.lock

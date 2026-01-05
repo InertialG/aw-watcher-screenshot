@@ -1,11 +1,11 @@
-use crate::event::{CaptureCommand, FocusWindow, ImageEvent};
+use crate::event::{CaptureCommand, CaptureEvent};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use crc32fast::Hasher;
 use image::{DynamicImage, imageops};
 use regex::Regex;
-use xcap::{Monitor, Window};
+use xcap::Monitor;
 
 struct MonitorInfo {
     name: String,
@@ -23,18 +23,9 @@ pub struct CaptureProcessor {
     config: CaptureConfig,
 }
 
-impl TaskProcessor<CaptureCommand, ImageEvent> for CaptureProcessor {
-    fn process(&mut self, _event: CaptureCommand) -> Result<ImageEvent, Error> {
-        let mut event = ImageEvent::new();
-
-        // Focus window info is optional - don't fail capture if we can't get it
-        let focus_window = match focus_window() {
-            Ok(fw) => fw,
-            Err(e) => {
-                tracing::warn!("Failed to get focus window info: {:?}", e);
-                None
-            }
-        };
+impl TaskProcessor<CaptureCommand, CaptureEvent> for CaptureProcessor {
+    fn process(&mut self, _event: CaptureCommand) -> Result<CaptureEvent, Error> {
+        let mut event = CaptureEvent::new();
 
         for monitor_info in &mut self.monitor_infos {
             let capture_res = capture(monitor_info.x, monitor_info.y).with_context(|| {
@@ -47,8 +38,6 @@ impl TaskProcessor<CaptureCommand, ImageEvent> for CaptureProcessor {
 
             event.add_image(monitor_info.hash.to_string(), capture_res);
         }
-
-        event.set_focus_window(focus_window);
 
         Ok(event)
     }
@@ -68,20 +57,6 @@ impl CaptureProcessor {
             config,
         })
     }
-}
-
-fn focus_window() -> Result<Option<FocusWindow>, Error> {
-    let Some(focus_window) = Window::all()?.into_iter().find(|w| {
-        let Ok(is_focused) = w.is_focused() else {
-            return false;
-        };
-        is_focused
-    }) else {
-        return Ok(None);
-    };
-
-    let focus_window = FocusWindow::new(focus_window)?;
-    Ok(Some(focus_window))
 }
 
 fn should_skip(

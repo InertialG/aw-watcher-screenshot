@@ -1,77 +1,29 @@
-use anyhow::{Error, Result};
 use chrono::{DateTime, Utc};
 use image::DynamicImage;
 use std::collections::HashMap;
 use std::sync::Arc;
-use uuid::Uuid;
-use xcap::Window;
 
-pub struct CaptureCommand {
-    pub reason: String,
-}
+pub type CaptureCommand = bool;
 
-impl CaptureCommand {
-    pub fn new(reason: String) -> Self {
-        Self { reason }
-    }
-}
-
-pub type WebpImage = Vec<u8>;
-pub struct ImageEvent {
-    pub id: Uuid,
+pub struct CaptureEvent {
     pub images: HashMap<String, Arc<DynamicImage>>,
-    pub datas: HashMap<String, Arc<WebpImage>>,
-    pub file_paths: HashMap<String, String>, // monitor_id -> local file path
     pub timestamp: DateTime<Utc>,
-    pub focus_window: Option<FocusWindow>,
 }
 
-pub struct FocusWindow {
-    pub title: String,
-    pub id: u32,
-    pub app_name: String,
-    pub position: (i32, i32),
-    pub size: (u32, u32),
-    pub current_monitor: u32,
-}
-
-impl ImageEvent {
+impl CaptureEvent {
     pub fn new() -> Self {
         Self {
-            id: Uuid::now_v7(),
             images: HashMap::new(),
-            datas: HashMap::new(),
-            file_paths: HashMap::new(),
             timestamp: Utc::now(),
-            focus_window: None,
         }
     }
 
-    pub fn set_focus_window(&mut self, focus_window: Option<FocusWindow>) -> &mut Self {
-        self.focus_window = focus_window;
-        self
-    }
-
-    pub fn get_id(&self) -> Uuid {
-        self.id
-    }
-
-    pub fn add_image(&mut self, id: String, image: DynamicImage) -> &mut Self {
+    pub fn add_image(&mut self, id: String, image: DynamicImage) {
         self.images.insert(id, Arc::new(image));
-        self
     }
 
-    pub fn get_image(&self, id: &str) -> Option<Arc<DynamicImage>> {
+    pub fn _get_image(&self, id: &str) -> Option<Arc<DynamicImage>> {
         self.images.get(id).cloned()
-    }
-
-    pub fn get_data(&self, id: &str) -> Option<Arc<WebpImage>> {
-        self.datas.get(id).cloned()
-    }
-
-    pub fn add_data(&mut self, id: String, data: Arc<WebpImage>) -> &mut Self {
-        self.datas.insert(id, data);
-        self
     }
 
     pub fn image_iter(&self) -> Vec<(String, Arc<DynamicImage>)> {
@@ -81,23 +33,100 @@ impl ImageEvent {
             .collect()
     }
 
-    pub fn data_iter(&self) -> Vec<(String, Arc<WebpImage>)> {
+    pub fn _get_format_timestamp(&self) -> String {
+        self.timestamp.format("%Y%m%d_%H%M%S%3f").to_string()
+    }
+
+    /// Returns the subdirectory path: {yyyy}/{mm}/{dd}/{hh}
+    pub fn get_path_subdir(&self) -> String {
+        self.timestamp.format("%Y/%m/%d/%H").to_string()
+    }
+
+    /// Returns the filename: {timestamp_millis}_{key}.webp
+    pub fn get_filename(&self, key: &str) -> String {
+        format!("{}_{}.webp", self.timestamp.timestamp_millis(), key)
+    }
+}
+
+pub type WebpImage = Vec<u8>;
+
+pub struct ImageEvent {
+    pub datas: HashMap<String, Arc<WebpImage>>,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl ImageEvent {
+    pub fn new(timestamp: DateTime<Utc>) -> Self {
+        Self {
+            datas: HashMap::new(),
+            timestamp,
+        }
+    }
+
+    pub fn add_data(&mut self, id: String, data: Arc<WebpImage>) {
+        self.datas.insert(id, data);
+    }
+
+    pub fn _data_iter(&self) -> Vec<(String, Arc<WebpImage>)> {
         self.datas
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect()
     }
-}
 
-impl FocusWindow {
-    pub fn new(window: Window) -> Result<Self, Error> {
-        Ok(Self {
-            title: window.title()?,
-            id: window.id()?,
-            app_name: window.app_name()?,
-            position: (window.x()?, window.y()?),
-            size: (window.width()?, window.height()?),
-            current_monitor: window.current_monitor()?.id()?,
-        })
+    pub fn _get_format_timestamp(&self) -> String {
+        self.timestamp.format("%Y%m%d_%H%M%S%3f").to_string()
+    }
+
+    /// Returns the subdirectory path: {yyyy}/{mm}/{dd}/{hh}
+    pub fn get_path_subdir(&self) -> String {
+        self.timestamp.format("%Y/%m/%d/%H").to_string()
+    }
+
+    /// Returns the filename: {timestamp_millis}_{key}.webp
+    pub fn get_filename(&self, key: &str) -> String {
+        format!("{}_{}.webp", self.timestamp.timestamp_millis(), key)
+    }
+
+    /// Consumes self and returns (AwEvent, data map)
+    pub fn into_parts(self) -> (AwEvent, HashMap<String, Arc<WebpImage>>) {
+        let mut aw_event = HashMap::new();
+        for (key, _) in self.datas.iter() {
+            aw_event.insert(
+                key.clone(),
+                format!("{}/{}", self.get_path_subdir(), self.get_filename(&key)),
+            );
+        }
+        (
+            AwEvent {
+                datas: aw_event,
+                timestamp: self.timestamp,
+            },
+            self.datas,
+        )
     }
 }
+
+pub struct AwEvent {
+    pub datas: HashMap<String, String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl AwEvent {
+    pub fn _new(timestamp: DateTime<Utc>) -> Self {
+        Self {
+            datas: HashMap::new(),
+            timestamp,
+        }
+    }
+
+    pub fn get_data(&self, key: &str) -> Option<&String> {
+        self.datas.get(key)
+    }
+
+    pub fn into_parts(self) -> (DateTime<Utc>, HashMap<String, String>) {
+        (self.timestamp, self.datas)
+    }
+}
+
+pub type CompleteCommand = bool;

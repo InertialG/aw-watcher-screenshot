@@ -29,3 +29,5 @@ xcap = "0.8.0"
 webp = "0.3.1"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 hostname = "0.4"
+aw-client-rust = "0.1.0"
+aw-models = "0.1.0"

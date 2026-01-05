@@ -1,7 +1,8 @@
 use crate::config::S3Config;
-use crate::event::ImageEvent;
+use crate::event::{AwEvent, ImageEvent};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
+use futures::future::join_all;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use tracing::{error, info, warn};
@@ -20,7 +21,7 @@ impl S3Processor {
     }
 }
 
-impl TaskProcessor<ImageEvent, ImageEvent> for S3Processor {
+impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
     fn init(&mut self) -> Result<(), Error> {
         if !self.config.enabled {
             info!("S3 upload is disabled");
@@ -53,39 +54,61 @@ impl TaskProcessor<ImageEvent, ImageEvent> for S3Processor {
         Ok(())
     }
 
-    fn process(&mut self, event: ImageEvent) -> Result<ImageEvent, Error> {
-        let Some(bucket) = &self.bucket else {
-            // S3 disabled, pass through
-            return Ok(event);
-        };
-
-        let prefix = self.config.key_prefix.as_deref().unwrap_or("");
-
-        for (key, data) in event.data_iter() {
-            // S3 key = prefix + filename (as confirmed by user)
-            let object_key = format!("{}{}--{}.webp", prefix, event.get_id(), key);
-
-            // rust-s3 requires tokio runtime for async operations
-            // We're in a blocking context (spawn_blocking), so we need block_on
-            let result = tokio::runtime::Handle::current()
-                .block_on(async { bucket.put_object(&object_key, &data).await });
-
-            match result {
-                Ok(response) => {
-                    let status = response.status_code();
-                    if status == 200 {
-                        info!("Uploaded {} to S3 ({} bytes)", object_key, data.len());
-                    } else {
-                        warn!("S3 upload {} returned status: {}", object_key, status);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to upload {} to S3: {:?}", object_key, e);
-                    // Continue with other files instead of failing completely
-                }
-            }
+    fn process(&mut self, event: ImageEvent) -> Result<AwEvent, Error> {
+        let (aw_event, datas) = event.into_parts();
+        if !self.config.enabled {
+            info!("S3 upload is disabled");
+            return Ok(aw_event);
         }
 
-        Ok(event)
+        let Some(bucket) = &self.bucket else {
+            // S3 disabled, pass through
+            return Ok(aw_event);
+        };
+
+        let _prefix = self.config.key_prefix.as_deref().unwrap_or("");
+
+        let runtime_handle = tokio::runtime::Handle::current();
+        runtime_handle.block_on(async {
+            let mut upload_futures = Vec::new();
+
+            for (key, data) in datas {
+                let Some(object_key) = aw_event.get_data(&key) else {
+                    warn!("Failed to get object key {}", key);
+                    continue;
+                };
+
+                let key_str = object_key.clone();
+
+                let upload_task = async move {
+                    let res = bucket
+                        .put_object_with_content_type(&key_str, &data, "image/webp")
+                        .await;
+                    (key_str, res)
+                };
+
+                upload_futures.push(upload_task);
+            }
+
+            let results = join_all(upload_futures).await;
+
+            for (object_key, result) in results {
+                match result {
+                    Ok(response) => {
+                        let status = response.status_code();
+                        if status == 200 {
+                            info!("Successfully uploaded {} to S3", object_key);
+                        } else {
+                            warn!("S3 upload {} returned status: {}", object_key, status);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to upload {} to S3: {:?}", object_key, e);
+                    }
+                }
+            }
+        });
+
+        Ok(aw_event)
     }
 }
