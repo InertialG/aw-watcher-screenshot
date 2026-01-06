@@ -30,16 +30,19 @@ impl AwServerProcessor {
 
 impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
     fn init(&mut self) -> Result<(), Error> {
-        let client = AwClient::new(
-            &self.config.host,
-            &self.config.port.to_string(),
-            &self.config.bucket_id,
-        );
+        let client = AwClient::new(&self.config.host, self.config.port);
 
         let bucket_id = format!("{}_{}", self.config.bucket_id, self.config.hostname);
 
+        let bucket = serde_json::json!({
+            "id": bucket_id,
+            "client": self.config.bucket_id,
+            "hostname": self.config.hostname,
+            "type": "uno.guan810.screenshot"
+        });
+
         client
-            .create_bucket(&bucket_id, "uno.guan810.screenshot")
+            .create_bucket(&bucket)
             .context("Failed to create bucket")?;
 
         self.client = Some(client);

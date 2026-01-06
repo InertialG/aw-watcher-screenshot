@@ -1,14 +1,161 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use anyhow::{Context, Result};
+use aw_models::{Bucket, Event};
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+
+pub struct AwClient {
+    client: reqwest::blocking::Client,
+    api_url: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+impl AwClient {
+    pub fn new(host: &str, port: u16) -> Self {
+        Self {
+            client: reqwest::blocking::Client::new(),
+            api_url: format!("http://{}:{}/api/0", host, port),
+        }
     }
+
+    pub fn create_bucket<T: serde::Serialize + ?Sized>(&self, bucket: &T) -> Result<()> {
+        let val = serde_json::to_value(bucket)?;
+        let bucket_id = val
+            .get("id")
+            .and_then(|v| v.as_str())
+            .context("Bucket object must have an 'id' field")?;
+
+        let url = format!("{}/buckets/{}", self.api_url, bucket_id);
+        self.client
+            .post(&url)
+            .json(bucket)
+            .send()
+            .context("Failed to send create bucket request")?
+            .error_for_status()
+            .context("Failed to create bucket")?;
+        Ok(())
+    }
+
+    pub fn delete_bucket(&self, bucket_id: &str) -> Result<()> {
+        let url = format!("{}/buckets/{}", self.api_url, bucket_id);
+        self.client
+            .delete(&url)
+            .send()
+            .context("Failed to send delete bucket request")?
+            .error_for_status()
+            .context("Failed to delete bucket")?;
+        Ok(())
+    }
+
+    pub fn heartbeat(&self, bucket_id: &str, event: &Event, pulsetime: f64) -> Result<()> {
+        let url = format!(
+            "{}/buckets/{}/heartbeat?pulsetime={}",
+            self.api_url, bucket_id, pulsetime
+        );
+        self.client
+            .post(&url)
+            .json(event)
+            .send()
+            .context("Failed to send heartbeat request")?
+            .error_for_status()
+            .context("Failed to send heartbeat")?;
+        Ok(())
+    }
+
+    pub fn insert_event(&self, bucket_id: &str, event: &Event) -> Result<()> {
+        let url = format!("{}/buckets/{}/events", self.api_url, bucket_id);
+        let events = vec![event];
+        self.client
+            .post(&url)
+            .json(&events)
+            .send()
+            .context("Failed to send insert event request")?
+            .error_for_status()
+            .context("Failed to insert event")?;
+        Ok(())
+    }
+
+    pub fn get_events(
+        &self,
+        bucket_id: &str,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u64>,
+    ) -> Result<Vec<Event>> {
+        let url = format!("{}/buckets/{}/events", self.api_url, bucket_id);
+        let mut params = Vec::new();
+        if let Some(s) = start {
+            params.push(("start", s.to_rfc3339()));
+        }
+        if let Some(e) = end {
+            params.push(("end", e.to_rfc3339()));
+        }
+        if let Some(l) = limit {
+            params.push(("limit", l.to_string()));
+        }
+
+        let resp = self
+            .client
+            .get(&url)
+            .query(&params)
+            .send()
+            .context("Failed to send get events request")?
+            .error_for_status()
+            .context("Get events returned error status")?;
+
+        let events = resp
+            .json::<Vec<Event>>()
+            .context("Failed to deserialize events")?;
+        Ok(events)
+    }
+
+    pub fn get_buckets(&self) -> Result<HashMap<String, Bucket>> {
+        let url = format!("{}/buckets", self.api_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .context("Failed to send get buckets request")?
+            .error_for_status()
+            .context("Get buckets returned error status")?;
+
+        let buckets = resp
+            .json::<HashMap<String, Bucket>>()
+            .context("Failed to deserialize buckets")?;
+        Ok(buckets)
+    }
+
+    pub fn get_bucket(&self, bucket_id: &str) -> Result<Bucket> {
+        let url = format!("{}/buckets/{}", self.api_url, bucket_id);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .context("Failed to send get bucket request")?
+            .error_for_status()
+            .context("Get bucket returned error status")?;
+
+        let bucket = resp
+            .json::<Bucket>()
+            .context("Failed to deserialize bucket")?;
+        Ok(bucket)
+    }
+
+    pub fn get_info(&self) -> Result<Info> {
+        let url = format!("{}/info", self.api_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .context("Failed to send get info request")?
+            .error_for_status()
+            .context("Get info returned error status")?;
+
+        let info = resp.json::<Info>().context("Failed to deserialize info")?;
+        Ok(info)
+    }
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct Info {
+    pub hostname: String,
+    pub testing: bool,
 }

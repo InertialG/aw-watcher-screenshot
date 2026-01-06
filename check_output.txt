@@ -1,0 +1,34 @@
+    Checking aw-client-lite v0.1.0 (C:\Users\horo8\project\aw-watcher-screenshot\crates\aw-client-lite)
+warning: unused import: `std::collections::HashMap`
+ --> crates\aw-client-lite\tests\client_test.rs:5:5
+  |
+5 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0560]: struct `Bucket` has no field named `type_`
+  --> crates\aw-client-lite\tests\client_test.rs:17:9
+   |
+17 |         type_: "test".to_string(),
+   |         ^^^^^ unknown field
+   |
+help: a field with a similar name exists
+   |
+17 -         type_: "test".to_string(),
+17 +         _type: "test".to_string(),
+   |
+
+error[E0308]: mismatched types
+  --> crates\aw-client-lite\tests\client_test.rs:21:19
+   |
+21 |         metadata: Map::new(),
+   |                   ^^^^^^^^^^ expected `BucketMetadata`, found `Map<String, Value>`
+   |
+   = note: expected struct `BucketMetadata`
+              found struct `serde_json::Map<std::string::String, Value>`
+
+Some errors have detailed explanations: E0308, E0560.
+For more information about an error, try `rustc --explain E0308`.
+warning: `aw-client-lite` (test "client_test") generated 1 warning
+error: could not compile `aw-client-lite` (test "client_test") due to 2 previous errors; 1 warning emitted
