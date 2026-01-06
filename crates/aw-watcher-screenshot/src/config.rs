@@ -70,6 +70,7 @@ pub struct AwServerConfig {
     pub port: u16,
     pub bucket_id: String,
     pub hostname: String,
+    pub timeout_secs: Option<u64>,
 }
 
 impl Default for AwServerConfig {
@@ -78,7 +79,11 @@ impl Default for AwServerConfig {
             host: "localhost".to_string(),
             port: 5600,
             bucket_id: "aw-watcher-screenshot".to_string(),
-            hostname: "unknown".to_string(),
+            hostname: hostname::get()
+                .ok()
+                .and_then(|s| s.into_string().ok())
+                .unwrap_or_else(|| "unknown".to_string()),
+            timeout_secs: Some(60),
         }
     }
 }

@@ -68,10 +68,10 @@ async fn main() -> Result<(), Error> {
     let (tx3, rx3) = mpsc::channel::<AwEvent>(30);
     let (tx4, rx4) = mpsc::channel::<CompleteCommand>(30);
 
-    let capture_worker = worker::Worker::new("capture".to_string(), capture_processor, rx0, tx1)?;
-    let cache_worker = worker::Worker::new("cache".to_string(), cache_processor, rx1, tx2)?;
-    let s3_worker = worker::Worker::new("s3".to_string(), s3_processor, rx2, tx3)?;
-    let metadata_worker = worker::Worker::new("awserver".to_string(), processor, rx3, tx4)?;
+    let capture_worker = worker::Worker::new("capture".to_string(), capture_processor, rx0, tx1);
+    let cache_worker = worker::Worker::new("cache".to_string(), cache_processor, rx1, tx2);
+    let s3_worker = worker::Worker::new("s3".to_string(), s3_processor, rx2, tx3);
+    let metadata_worker = worker::Worker::new("awserver".to_string(), processor, rx3, tx4);
 
     let aw_handler = metadata_worker.start();
     let s3_handler = s3_worker.start();

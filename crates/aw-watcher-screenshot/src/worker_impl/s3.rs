@@ -1,5 +1,5 @@
 use crate::config::S3Config;
-use crate::event::{AwEvent, ImageEvent};
+use crate::event::{AwEvent, ImageEvent, UploadS3Info};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
 use futures::future::join_all;
@@ -55,7 +55,12 @@ impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
     }
 
     fn process(&mut self, event: ImageEvent) -> Result<AwEvent, Error> {
-        let (aw_event, datas) = event.into_parts();
+        let (aw_event, datas) = event.into_parts(UploadS3Info::new(
+            self.config.endpoint.clone(),
+            self.config.bucket.clone(),
+            self.config.key_prefix.clone().unwrap_or_default(),
+        ));
+
         if !self.config.enabled {
             info!("S3 upload is disabled");
             return Ok(aw_event);
@@ -66,25 +71,32 @@ impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
             return Ok(aw_event);
         };
 
-        let _prefix = self.config.key_prefix.as_deref().unwrap_or("");
-
         let runtime_handle = tokio::runtime::Handle::current();
         runtime_handle.block_on(async {
             let mut upload_futures = Vec::new();
 
             for (key, data) in datas {
-                let Some(object_key) = aw_event.get_data(&key) else {
-                    warn!("Failed to get object key {}", key);
+                let Some(upload_info) = aw_event.get_data(key) else {
+                    warn!("Failed to get upload info for key {}", key);
                     continue;
                 };
 
-                let key_str = object_key.clone();
+                if data.payload.is_none() {
+                    warn!("No payload for key {}", key);
+                    continue;
+                }
+
+                let bucket = bucket.clone();
+                let object_path = upload_info.object_key.clone();
+                let data_arc = std::sync::Arc::clone(&data);
 
                 let upload_task = async move {
+                    let payload = data_arc.payload.as_ref().unwrap();
                     let res = bucket
-                        .put_object_with_content_type(&key_str, &data, "image/webp")
+                        .put_object_with_content_type(&object_path, payload, "image/webp")
                         .await;
-                    (key_str, res)
+
+                    (object_path, res)
                 };
 
                 upload_futures.push(upload_task);
@@ -92,18 +104,18 @@ impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
 
             let results = join_all(upload_futures).await;
 
-            for (object_key, result) in results {
+            for (object_path, result) in results {
                 match result {
                     Ok(response) => {
                         let status = response.status_code();
                         if status == 200 {
-                            info!("Successfully uploaded {} to S3", object_key);
+                            info!("Successfully uploaded {} to S3", object_path);
                         } else {
-                            warn!("S3 upload {} returned status: {}", object_key, status);
+                            warn!("S3 upload {} returned status: {}", object_path, status);
                         }
                     }
                     Err(e) => {
-                        error!("Failed to upload {} to S3: {:?}", object_key, e);
+                        error!("Failed to upload {} to S3: {:?}", object_path, e);
                     }
                 }
             }

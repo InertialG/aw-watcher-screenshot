@@ -25,16 +25,13 @@ where
     I: Send + 'static,
     O: Send + 'static,
 {
-    pub fn new(name: String, mut processor: P, rx: Receiver<I>, tx: Sender<O>) -> Result<Self> {
-        processor.init()?;
-        info!("Worker {} initialized successfully.", name);
-
-        Ok(Self {
+    pub fn new(name: String, processor: P, rx: Receiver<I>, tx: Sender<O>) -> Self {
+        Self {
             name,
             processor,
             rx,
             tx,
-        })
+        }
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
@@ -50,6 +47,13 @@ where
                     info!("Worker {} stopped gracefully.", name_guard);
                 }
             });
+
+            // Initialize inside spawn_blocking so block_on can be used
+            if let Err(e) = self.processor.init() {
+                error!("Worker {} init failed: {:?}", name, e);
+                return;
+            }
+            info!("Worker {} initialized successfully.", name);
 
             info!("Worker {} started.", name);
 

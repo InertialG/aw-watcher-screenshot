@@ -1,30 +1,52 @@
 use std::collections::HashMap;
 
-use crate::event::CompleteCommand;
+use crate::event::{CompleteCommand, UploadImageInfo, UploadS3Info};
 use crate::worker::TaskProcessor;
 use crate::{config::AwServerConfig, event::AwEvent};
 use anyhow::{Context, Error, Result};
 use aw_client_lite::AwClient;
 use aw_models::Event;
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{Map, Value};
+use tokio::runtime::Handle;
+use tracing::info;
 
 pub struct AwServerProcessor {
     config: AwServerConfig,
     client: Option<AwClient>,
     bucket_id: Option<String>,
+    handle: Handle,
 
-    last_datas: Option<HashMap<String, String>>,
+    timeout: Duration,
+    last_datas: Option<AwEvent>,
+    last_timestamp: Option<HashMap<u32, DateTime<Utc>>>,
 }
 
 impl AwServerProcessor {
     pub fn new(config: AwServerConfig) -> Self {
+        let timeout = config.timeout_secs.unwrap_or(60);
         Self {
             config,
             client: None,
             bucket_id: None,
+            handle: Handle::current(),
+            timeout: Duration::seconds(timeout as i64),
             last_datas: None,
+            last_timestamp: None,
         }
+    }
+
+    fn heartbeat_data(&self, upload: &Event, pulse_time: f64) -> Result<(), Error> {
+        let Some(bucket_id) = &self.bucket_id else {
+            return Err(anyhow::anyhow!("Bucket ID not initialized"));
+        };
+        let Some(client) = &self.client else {
+            return Err(anyhow::anyhow!("Client not initialized"));
+        };
+        self.handle
+            .block_on(client.heartbeat(bucket_id, upload, pulse_time))
+            .context("Failed to send heartbeat")?;
+        Ok(())
     }
 }
 
@@ -41,71 +63,101 @@ impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
             "type": "uno.guan810.screenshot"
         });
 
-        client
-            .create_bucket(&bucket)
+        self.handle
+            .block_on(client.create_bucket(&bucket))
             .context("Failed to create bucket")?;
 
         self.client = Some(client);
         self.bucket_id = Some(bucket_id);
 
+        info!("AwServer initialized successfully.");
+
         Ok(())
     }
 
-    fn process(&mut self, event: AwEvent) -> Result<CompleteCommand, Error> {
-        let Some(bucket_id) = &self.bucket_id else {
-            return Err(anyhow::anyhow!("Bucket ID not initialized"));
-        };
-        let Some(client) = &self.client else {
-            return Err(anyhow::anyhow!("Client not initialized"));
-        };
+    fn process(&mut self, mut event: AwEvent) -> Result<CompleteCommand, Error> {
+        let timestamp = event.timestamp;
 
-        let (timestamp, mut datas) = event.into_parts();
-        let is_empty = datas.is_empty();
+        let last_timestamp = self.last_timestamp.get_or_insert_with(HashMap::new);
 
+        if event.datas.is_empty() {
+            let Some(last_heartbeat) = &self.last_datas else {
+                return Err(anyhow::anyhow!("Empty heartbeat at first."));
+            };
+
+            info!("Some heartbeat data with last one.");
+            let heart_beat = Event {
+                id: None,
+                timestamp,
+                duration: Duration::zero(),
+                data: create_heartbeat_data(&last_heartbeat),
+            };
+            self.heartbeat_data(&heart_beat, 10.0)?;
+            return Ok(true);
+        }
+
+        // Update last_timestamp for current images
+        for key in event.datas.keys() {
+            last_timestamp.insert(*key, timestamp);
+        }
+
+        // Check last_datas for missing images and retention
         if let Some(last_datas) = &self.last_datas {
-            if !is_empty {
-                let finish = Event {
-                    id: None,
-                    timestamp: timestamp - Duration::milliseconds(1),
-                    duration: Duration::zero(), // TODO：待验证
-                    data: change_datas(&last_datas),
-                };
-                client
-                    .heartbeat(&bucket_id, &finish, 10.0)
-                    .context("Failed to send heartbeat")?;
-            }
-
-            for (key, value) in last_datas.iter() {
-                if !datas.contains_key(key) {
-                    datas.insert(key.clone(), value.clone());
+            for (key, value) in last_datas.datas.iter() {
+                if !event.datas.contains_key(key) {
+                    if let Some(last_ts) = last_timestamp.get(key) {
+                        if timestamp - *last_ts <= self.timeout {
+                            // Keep image if within timeout
+                            event.add_data(*key, value.clone());
+                        }
+                    }
                 }
             }
-        } else {
-            if is_empty {
-                return Err(anyhow::anyhow!("Empty datas in first event."));
-            }
-        };
+        }
 
-        // 更新 last_datas
-        self.last_datas = Some(datas);
+        // Clean up last_timestamp for images no longer being tracked
+        last_timestamp.retain(|key, _| event.datas.contains_key(key));
+
+        if let Some(last_datas) = &self.last_datas {
+            let finish = Event {
+                id: None,
+                timestamp: timestamp - Duration::milliseconds(1),
+                duration: Duration::zero(),
+                data: create_heartbeat_data(&last_datas),
+            };
+            self.heartbeat_data(&finish, 10.0)?;
+        }
 
         let heartbeat = Event {
             id: None,
-            timestamp: timestamp,
+            timestamp,
             duration: Duration::zero(),
-            data: change_datas(self.last_datas.as_ref().unwrap()),
+            data: create_heartbeat_data(&event),
         };
 
-        client
-            .heartbeat(&bucket_id, &heartbeat, 10.0)
-            .context("Failed to send heartbeat")?;
+        self.heartbeat_data(&heartbeat, 10.0)?;
+
+        self.last_datas = Some(event);
         Ok(true)
     }
 }
 
-fn change_datas(datas: &HashMap<String, String>) -> Map<String, Value> {
-    datas
-        .into_iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect()
+fn create_heartbeat_data(event: &AwEvent) -> Map<String, Value> {
+    let mut map = Map::new();
+    map.insert(
+        "local_dir".to_string(),
+        Value::String(event.local_dir.display().to_string()),
+    );
+    map.insert(
+        "s3_info".to_string(),
+        serde_json::to_value(event.s3_info.clone()).unwrap_or(Value::Null),
+    );
+
+    let mut images = Vec::new();
+    for value in event.datas.values() {
+        images.push(serde_json::to_value(value.clone()).unwrap_or(Value::Null));
+    }
+    map.insert("images".to_string(), Value::Array(images));
+
+    map
 }

@@ -2,24 +2,30 @@ use crate::event::{CaptureCommand, CaptureEvent};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
 use chrono::{DateTime, TimeDelta, Utc};
-use crc32fast::Hasher;
 use image::{DynamicImage, imageops};
-use regex::Regex;
+use tracing::info;
 use xcap::Monitor;
 
-struct MonitorInfo {
-    name: String,
-    hash: u32,
-    x: i32,
-    y: i32,
+use crate::event::ImageInfo;
+
+struct MonitorState {
     last_dhash: Option<u64>,
     last_time: Option<DateTime<Utc>>,
+}
+
+impl MonitorState {
+    fn new() -> Self {
+        Self {
+            last_dhash: None,
+            last_time: None,
+        }
+    }
 }
 
 use crate::config::CaptureConfig;
 
 pub struct CaptureProcessor {
-    monitor_infos: Vec<MonitorInfo>,
+    monitor_states: Vec<ImageInfo<MonitorState>>,
     config: CaptureConfig,
 }
 
@@ -27,16 +33,28 @@ impl TaskProcessor<CaptureCommand, CaptureEvent> for CaptureProcessor {
     fn process(&mut self, _event: CaptureCommand) -> Result<CaptureEvent, Error> {
         let mut event = CaptureEvent::new();
 
-        for monitor_info in &mut self.monitor_infos {
-            let capture_res = capture(monitor_info.x, monitor_info.y).with_context(|| {
-                format!("Failed to capture image from monitor {}", monitor_info.hash)
+        for monitor_state in &mut self.monitor_states {
+            let capture_res = capture(monitor_state.x, monitor_state.y).with_context(|| {
+                format!(
+                    "Failed to capture image from monitor {}",
+                    monitor_state.get_friendly_name()
+                )
             })?;
 
-            if should_skip(&self.config, &capture_res, monitor_info) {
+            if should_skip(
+                &self.config,
+                &capture_res,
+                monitor_state
+                    .payload
+                    .as_mut()
+                    .context("Monitor state not found")?,
+            ) {
                 continue;
             }
 
-            event.add_image(monitor_info.hash.to_string(), capture_res);
+            let mut image_info = ImageInfo::from_base_info(&monitor_state);
+            image_info.set_payload(capture_res);
+            event.add_image(image_info);
         }
 
         Ok(event)
@@ -46,14 +64,16 @@ impl TaskProcessor<CaptureCommand, CaptureEvent> for CaptureProcessor {
 impl CaptureProcessor {
     pub fn new(config: CaptureConfig) -> Result<Self, Error> {
         let real_monitors = Monitor::all()?;
-        let mut monitor_infos = Vec::new();
-        for monitor in real_monitors {
-            let monitor_info = hash_position(&monitor)?;
-            monitor_infos.push(monitor_info);
+        info!("Found {} monitors", real_monitors.len());
+        let mut monitor_states = Vec::new();
+        for monitor in real_monitors.iter() {
+            let mut image_info = ImageInfo::new(monitor)?;
+            image_info.set_payload(MonitorState::new());
+            monitor_states.push(image_info);
         }
 
         Ok(Self {
-            monitor_infos,
+            monitor_states,
             config,
         })
     }
@@ -62,16 +82,16 @@ impl CaptureProcessor {
 fn should_skip(
     config: &CaptureConfig,
     image: &DynamicImage,
-    monitor_info: &mut MonitorInfo,
+    monitor_state: &mut MonitorState,
 ) -> bool {
     let dhash = dhash(image);
     let now = Utc::now();
 
-    if let Some(last_time) = monitor_info.last_time {
+    if let Some(last_time) = monitor_state.last_time {
         // Use configured force interval
         if now - last_time > TimeDelta::try_seconds(config.force_interval_secs as i64).unwrap() {
-            monitor_info.last_dhash = Some(dhash);
-            monitor_info.last_time = Some(now);
+            monitor_state.last_dhash = Some(dhash);
+            monitor_state.last_time = Some(now);
             return false;
         }
 
@@ -81,15 +101,15 @@ fn should_skip(
         }
     }
 
-    if let Some(last_dhash) = monitor_info.last_dhash {
+    if let Some(last_dhash) = monitor_state.last_dhash {
         // Use configured dhash threshold
         if hamming_distance(dhash, last_dhash) < config.dhash_threshold {
             return true;
         }
     }
 
-    monitor_info.last_dhash = Some(dhash);
-    monitor_info.last_time = Some(now);
+    monitor_state.last_dhash = Some(dhash);
+    monitor_state.last_time = Some(now);
     false
 }
 
@@ -98,38 +118,6 @@ fn capture(x: i32, y: i32) -> Result<DynamicImage, Error> {
     let image = monitor.capture_image()?;
     let image = DynamicImage::ImageRgba8(image);
     Ok(image)
-}
-
-fn hash_position(monitor: &Monitor) -> Result<MonitorInfo, Error> {
-    let name = monitor.name()?;
-    let x = monitor.x()?;
-    let y = monitor.y()?;
-    let width = monitor.width()?;
-    let height = monitor.height()?;
-
-    let re = Regex::new(r"[^a-zA-Z0-9]")?;
-    let safe_name = re.replace_all(&name, "").to_string();
-    let prefix = if safe_name.is_empty() {
-        "Monitor".to_string()
-    } else {
-        safe_name
-    };
-    let geometry_fingerprint = format!("{}_{}_{}_{}_{}", name, width, height, x, y);
-    let hash = calculate_crc32(&geometry_fingerprint);
-    Ok(MonitorInfo {
-        name: format!("{}_{}", prefix, hash),
-        hash,
-        x,
-        y,
-        last_dhash: None,
-        last_time: None,
-    })
-}
-
-fn calculate_crc32(data: &str) -> u32 {
-    let mut hasher = Hasher::new();
-    hasher.update(data.as_bytes());
-    hasher.finalize()
 }
 
 pub fn dhash(image: &DynamicImage) -> u64 {
