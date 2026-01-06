@@ -4,7 +4,7 @@ use crate::event::CompleteCommand;
 use crate::worker::TaskProcessor;
 use crate::{config::AwServerConfig, event::AwEvent};
 use anyhow::{Context, Error, Result};
-use aw_client_rust::AwClient;
+use aw_client_lite::AwClient;
 use aw_models::Event;
 use chrono::Duration;
 use serde_json::{Map, Value};

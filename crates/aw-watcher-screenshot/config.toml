@@ -1,0 +1,30 @@
+[trigger]
+interval_secs = 2
+timeout_secs = 3600
+
+[capture]
+force_interval_secs = 60
+dhash_threshold = 10
+
+[cache]
+cache_dir = "test_cache"
+# WebP quality (1-100). Use 100 for lossless, lower for smaller files.
+# 75 is a good balance between quality and speed/size.
+webp_quality = 75
+
+[sqlite]
+db_path = "test_db.sqlite"
+
+# S3 / Object Storage configuration (optional)
+# Set enabled = true and fill in your credentials to enable upload
+[s3]
+enabled = true
+endpoint = "https://rustfs.guan810.uno"
+bucket = "aw-screenshot"
+access_key = "C7UxruzHYDleb2yjaFVk"
+secret_key = "vceAwZiFXbrHSJYEmN5yRl42dInLB3C7ugO0aWKV"
+region = "auto"
+# key_prefix = "screenshots/"
+
+[aw_server]
+enabled = true
