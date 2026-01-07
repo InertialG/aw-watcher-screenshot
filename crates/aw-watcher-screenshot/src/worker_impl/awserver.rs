@@ -1,148 +1,137 @@
 use std::collections::HashMap;
 
-use crate::event::{CompleteCommand, UploadImageInfo, UploadS3Info};
-use crate::worker::TaskProcessor;
+use crate::worker::Consumer;
 use crate::{config::AwServerConfig, event::AwEvent};
-use anyhow::{Context, Error, Result};
-use async_trait::async_trait;
+use anyhow::Error;
 use aw_client_lite::AwClient;
 use aw_models::Event;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Map, Value};
-use tracing::info;
+use tokio::sync::mpsc::Receiver;
+use tokio::task::JoinHandle;
+use tracing::{error, info};
 
 pub struct AwServerProcessor {
     config: AwServerConfig,
-    client: Option<AwClient>,
-    bucket_id: Option<String>,
+    client: AwClient,
+    bucket_id: String,
 
     timeout: Duration,
     last_datas: Option<AwEvent>,
-    last_timestamp: Option<HashMap<u32, DateTime<Utc>>>,
+    last_timestamp: HashMap<u32, DateTime<Utc>>,
 }
 
 impl AwServerProcessor {
-    pub fn new(config: AwServerConfig) -> Self {
+    pub async fn new(config: AwServerConfig) -> Result<Self, Error> {
         let timeout = config.timeout_secs.unwrap_or(60);
-        Self {
-            config,
-            client: None,
-            bucket_id: None,
-            timeout: Duration::seconds(timeout as i64),
-            last_datas: None,
-            last_timestamp: None,
-        }
-    }
+        let client = AwClient::new(&config.host, config.port);
 
-    async fn heartbeat_data(&self, upload: &Event, pulse_time: f64) -> Result<(), Error> {
-        let Some(bucket_id) = &self.bucket_id else {
-            return Err(anyhow::anyhow!("Bucket ID not initialized"));
-        };
-        let Some(client) = &self.client else {
-            return Err(anyhow::anyhow!("Client not initialized"));
-        };
-        client
-            .heartbeat(bucket_id, upload, pulse_time)
-            .await
-            .context("Failed to send heartbeat")?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
-    async fn init(&mut self) -> Result<(), Error> {
-        let client = AwClient::new(&self.config.host, self.config.port);
-
-        let bucket_id = format!("{}_{}", self.config.bucket_id, self.config.hostname);
+        let bucket_id = format!("{}_{}", config.bucket_id, config.hostname);
 
         let bucket = serde_json::json!({
             "id": bucket_id,
-            "client": self.config.bucket_id,
-            "hostname": self.config.hostname,
+            "client": config.bucket_id,
+            "hostname": config.hostname,
             "type": "uno.guan810.screenshot"
         });
 
-        client
-            .create_bucket(&bucket)
-            .await
-            .context("Failed to create bucket")?;
-
-        self.client = Some(client);
-        self.bucket_id = Some(bucket_id);
-
+        client.create_bucket(&bucket).await?;
         info!("AwServer initialized successfully.");
 
-        Ok(())
+        Ok(Self {
+            config,
+            client,
+            bucket_id,
+            timeout: Duration::seconds(timeout as i64),
+            last_datas: None,
+            last_timestamp: HashMap::new(),
+        })
     }
 
-    async fn process(&mut self, mut event: AwEvent) -> Result<CompleteCommand, Error> {
-        let timestamp = event.timestamp;
+    pub async fn heartbeat(&self, event: &Event, pulse_time: f64) {
+        if let Err(e) = self
+            .client
+            .heartbeat(&self.bucket_id, event, pulse_time)
+            .await
+        {
+            error!("Failed to heartbeat: {}", e);
+        }
+    }
+}
+
+impl Consumer<AwEvent> for AwServerProcessor {
+    fn consume(mut self, mut rx: Receiver<AwEvent>) -> Result<JoinHandle<()>, Error> {
         let Some(pulse_time) = self.config.pulse_time else {
             return Err(anyhow::anyhow!("Pulse time not initialized"));
         };
 
-        let last_timestamp = self.last_timestamp.get_or_insert_with(HashMap::new);
+        Ok(tokio::spawn(async move {
+            while let Some(mut event) = rx.recv().await {
+                let timestamp = event.timestamp;
 
-        if event.datas.is_empty() {
-            let Some(last_heartbeat) = &self.last_datas else {
-                return Err(anyhow::anyhow!("Empty heartbeat at first."));
-            };
+                if event.datas.is_empty() {
+                    let Some(last_heartbeat) = &self.last_datas else {
+                        error!("Empty heartbeat at first.");
+                        continue;
+                    };
 
-            info!("Some heartbeat data with last one.");
-            let heart_beat = Event {
-                id: None,
-                timestamp,
-                duration: Duration::zero(),
-                data: create_heartbeat_data(&last_heartbeat),
-            };
-            self.heartbeat_data(&heart_beat, pulse_time).await?;
-            return Ok(true);
-        }
+                    info!("Same heartbeat data with last one.");
+                    let heart_beat = Event {
+                        id: None,
+                        timestamp: last_heartbeat.timestamp,
+                        duration: Duration::zero(),
+                        data: create_heartbeat_data(&last_heartbeat),
+                    };
 
-        // Update last_timestamp for current images
-        for key in event.datas.keys() {
-            last_timestamp.insert(*key, timestamp);
-        }
+                    self.heartbeat(&heart_beat, pulse_time).await;
+                    continue;
+                }
 
-        // Check last_datas for missing images and retention
-        if let Some(last_datas) = &self.last_datas {
-            for (key, value) in last_datas.datas.iter() {
-                if !event.datas.contains_key(key) {
-                    if let Some(last_ts) = last_timestamp.get(key) {
-                        if timestamp - *last_ts <= self.timeout {
-                            // Keep image if within timeout
-                            event.add_data(*key, value.clone());
+                // Update last_timestamp for current images
+                for key in event.datas.keys() {
+                    self.last_timestamp.insert(*key, timestamp);
+                }
+
+                // Check last_datas for missing images and retention
+                if let Some(last_datas) = &self.last_datas {
+                    for (key, value) in last_datas.datas.iter() {
+                        if !event.datas.contains_key(key) {
+                            if let Some(last_ts) = self.last_timestamp.get(key) {
+                                if timestamp - *last_ts <= self.timeout {
+                                    // Keep image if within timeout
+                                    event.add_data(*key, value.clone());
+                                }
+                            }
                         }
                     }
                 }
+
+                // Clean up last_timestamp for images no longer being tracked
+                self.last_timestamp
+                    .retain(|key, _| event.datas.contains_key(key));
+
+                if let Some(last_datas) = &self.last_datas {
+                    let finish = Event {
+                        id: None,
+                        timestamp: timestamp - Duration::milliseconds(1),
+                        duration: Duration::zero(),
+                        data: create_heartbeat_data(&last_datas),
+                    };
+                    self.heartbeat(&finish, pulse_time).await;
+                }
+
+                let heartbeat = Event {
+                    id: None,
+                    timestamp,
+                    duration: Duration::zero(),
+                    data: create_heartbeat_data(&event),
+                };
+
+                self.heartbeat(&heartbeat, pulse_time).await;
+
+                self.last_datas = Some(event);
             }
-        }
-
-        // Clean up last_timestamp for images no longer being tracked
-        last_timestamp.retain(|key, _| event.datas.contains_key(key));
-
-        if let Some(last_datas) = &self.last_datas {
-            let finish = Event {
-                id: None,
-                timestamp: timestamp - Duration::milliseconds(1),
-                duration: Duration::zero(),
-                data: create_heartbeat_data(&last_datas),
-            };
-            self.heartbeat_data(&finish, pulse_time).await?;
-        }
-
-        let heartbeat = Event {
-            id: None,
-            timestamp,
-            duration: Duration::zero(),
-            data: create_heartbeat_data(&event),
-        };
-
-        self.heartbeat_data(&heartbeat, pulse_time).await?;
-
-        self.last_datas = Some(event);
-        Ok(true)
+        }))
     }
 }
 

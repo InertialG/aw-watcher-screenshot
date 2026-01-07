@@ -1,146 +1,229 @@
-//! Timer-based screenshot processor.
+//! Timer-based screenshot capture processor.
 //!
-//! This module provides a `TaskProcessor` that combines timer triggering
-//! with screenshot capture functionality, producing `CaptureEvent`s on a
-//! regular interval.
+//! This module provides a `Producer` that captures screenshots from all monitors
+//! on a regular interval. The captured images are sent downstream for filtering.
 
-use crate::config::{CaptureConfig, TriggerConfig};
-use crate::event::CaptureEvent;
-use crate::screenshot::ScreenshotService;
+use crate::config::TriggerConfig;
+use crate::event::{CaptureEvent, UploadImageInfo};
 use crate::worker::Producer;
-use anyhow::{Error, Result};
-use async_trait::async_trait;
+use anyhow::{Context, Error, Result};
+use image::DynamicImage;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
-use tokio::time::{self, Instant, Interval, sleep};
+use tokio::time::{self, Interval, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use xcap::Monitor;
 
-/// Timer-based screenshot processor that produces `CaptureEvent`s on a schedule.
+/// Monitor information for capture.
+struct MonitorInfo {
+    name: String,
+    id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl MonitorInfo {
+    fn new(monitor: Monitor) -> Result<Self, Error> {
+        Ok(Self {
+            name: monitor.name()?,
+            id: monitor.id()?,
+            x: monitor.x()?,
+            y: monitor.y()?,
+            width: monitor.width()?,
+            height: monitor.height()?,
+        })
+    }
+
+    fn get_friendly_name(&self) -> String {
+        format!(
+            "{}_{}_{}_{}_{}",
+            self.name, self.width, self.height, self.x, self.y
+        )
+    }
+}
+
+/// Timer-based screenshot producer that captures from all monitors.
 ///
-/// This processor operates in **Source mode**, meaning it has no input channel
-/// and only produces outputs. It combines the functionality of the original
-/// `TimerTrigger` and `CaptureProcessor` into a single unified processor.
+/// This producer operates in **Source mode**, meaning it has no input channel
+/// and only produces outputs. It captures screenshots at regular intervals
+/// without any filtering - filtering is done by a downstream processor.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let processor = TimerScreenshotProducer::new(trigger_config, capture_config)?;
-/// let worker = Worker::source("timer_screenshot", processor, tx);
-/// worker.start();
+/// let producer = TimerCaptureProducer::new(trigger_config, token)?;
+/// // Wire to filter processor downstream
 /// ```
-pub struct TimerScreenshotProducer {
-    screenshot_service: ScreenshotService,
+pub struct TimerCaptureProducer {
+    monitors: Vec<MonitorInfo>,
     interval: Interval,
     timeout: Option<Duration>,
-    start_time: Option<Instant>,
-
     token: CancellationToken,
 }
 
-impl TimerScreenshotProducer {
-    /// Create a new timer-based screenshot processor.
+impl TimerCaptureProducer {
+    /// Create a new timer-based capture producer.
     ///
     /// # Arguments
     ///
     /// * `trigger_config` - Configuration for timer interval and timeout
-    /// * `capture_config` - Configuration for screenshot capture (dhash threshold, etc.)
-    pub fn new(
-        trigger_config: TriggerConfig,
-        capture_config: CaptureConfig,
-        token: CancellationToken,
-    ) -> Result<Self, Error> {
-        let screenshot_service = ScreenshotService::new(capture_config)?;
+    /// * `token` - Cancellation token for graceful shutdown
+    pub fn new(trigger_config: TriggerConfig, token: CancellationToken) -> Result<Self, Error> {
+        let real_monitors = Monitor::all()?;
+        info!(
+            "TimerCaptureProducer: Found {} monitors",
+            real_monitors.len()
+        );
+
+        let mut monitors = Vec::new();
+        for monitor in real_monitors {
+            let monitor_info = MonitorInfo::new(monitor)?;
+            monitors.push(monitor_info);
+        }
+
         let interval_duration = Duration::from_secs(trigger_config.interval_secs);
         let timeout = trigger_config.timeout_secs.map(Duration::from_secs);
 
         Ok(Self {
-            screenshot_service,
+            monitors,
             interval: time::interval(interval_duration),
             timeout,
-            start_time: None,
             token,
         })
     }
 
-    /// Create a new timer-based screenshot processor with just Duration values.
-    ///
-    /// This is a convenience constructor for simpler use cases.
-    pub fn with_duration(
+    /// Create a new timer-based capture producer with just Duration values.
+    pub fn _with_duration(
         interval: Duration,
         timeout: Option<Duration>,
-        capture_config: CaptureConfig,
         token: CancellationToken,
     ) -> Result<Self, Error> {
-        let screenshot_service = ScreenshotService::new(capture_config)?;
+        let real_monitors = Monitor::all()?;
+        info!(
+            "TimerCaptureProducer: Found {} monitors",
+            real_monitors.len()
+        );
+
+        let mut monitors = Vec::new();
+        for monitor in real_monitors {
+            let monitor_info = MonitorInfo::new(monitor)?;
+            monitors.push(monitor_info);
+        }
 
         Ok(Self {
-            screenshot_service,
+            monitors,
             interval: time::interval(interval),
             timeout,
-            start_time: None,
             token,
         })
     }
 
-    fn is_timeout_reached(&self) -> bool {
-        if let (Some(timeout), Some(start)) = (self.timeout, self.start_time) {
-            start.elapsed() >= timeout
-        } else {
-            false
+    /// Capture screenshots from all monitors.
+    fn _capture_all(&self) -> Result<CaptureEvent, Error> {
+        let mut event = CaptureEvent::new();
+
+        for monitor_info in &self.monitors {
+            let capture_res =
+                capture_monitor(monitor_info.x, monitor_info.y).with_context(|| {
+                    format!(
+                        "Failed to capture image from monitor {}",
+                        monitor_info.get_friendly_name()
+                    )
+                })?;
+
+            let upload_info = UploadImageInfo::new(
+                monitor_info.get_friendly_name(),
+                monitor_info.id,
+                String::new(), // Object key will be set by filter processor
+            );
+
+            event.add_image(monitor_info.id, capture_res, upload_info);
         }
+
+        Ok(event)
     }
 }
 
-#[async_trait]
-impl Producer<CaptureEvent> for TimerScreenshotProducer {
-    async fn produce(mut self, tx: Sender<CaptureEvent>) -> Result<JoinHandle<()>, Error> {
+/// Capture a screenshot from the monitor at the given screen coordinates.
+fn capture_monitor(x: i32, y: i32) -> Result<DynamicImage, Error> {
+    let monitor = Monitor::from_point(x, y)?;
+    let image = monitor.capture_image()?;
+    let image = DynamicImage::ImageRgba8(image);
+    Ok(image)
+}
+
+// #[async_trait]
+impl Producer<CaptureEvent> for TimerCaptureProducer {
+    fn produce(mut self, tx: Sender<CaptureEvent>) -> Result<JoinHandle<()>, Error> {
         let handler = tokio::spawn(async move {
-            let mut timeout_future: Pin<Box<dyn Future<Output = ()> + Send>> = match self.timeout {
+            let timeout_future: Pin<Box<dyn Future<Output = ()> + Send>> = match self.timeout {
                 Some(duration) => Box::pin(sleep(duration)),
-                None => Box::pin(std::future::pending()),
+                None => Box::pin(std::future::pending::<()>()),
             };
-            let mut service = Arc::new(self.screenshot_service);
+            // Pin the future so we can borrow it in the select! loop
+            tokio::pin!(timeout_future);
 
             loop {
                 tokio::select! {
                     _ = self.token.cancelled() => {
-                        info!("TimerScreenshotProducer cancelled");
+                        info!("TimerCaptureProducer cancelled");
                         break;
                     }
-                    _ = timeout_future => {
-                        info!("TimerScreenshotProducer timed out");
+                    _ = &mut timeout_future => {
+                        info!("TimerCaptureProducer timed out");
                         break;
                     }
                     _ = self.interval.tick() => {
-                        let service_cloned = Arc::clone(&service);
+                        // Capture in blocking task since xcap operations are blocking
+                        let monitors_clone: Vec<(i32, i32, String, u32)> = self.monitors
+                            .iter()
+                            .map(|m| (m.x, m.y, m.get_friendly_name(), m.id))
+                            .collect();
+
                         match tokio::task::spawn_blocking(move || {
-                            let event = service_cloned.capture()?;
-                            Ok(event)
+                            let mut event = CaptureEvent::new();
+                            for (x, y, name, id) in monitors_clone {
+                                match capture_monitor(x, y) {
+                                    Ok(image) => {
+                                        let upload_info = UploadImageInfo::new(
+                                            name,
+                                            id,
+                                            format!(
+                                                "{}/{}.webp",
+                                                event.timestamp.format("%Y/%m/%d/%H"),
+                                                format!("{}_{}", event.timestamp.format("%Y%m%d_%H%M%S%3f"), id)
+                                            ),
+                                        );
+                                        event.add_image(id, image, upload_info);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to capture monitor {}: {:?}", id, e);
+                                    }
+                                }
+                            }
+                            event
                         }).await {
-                            Ok(Ok(event)) => {
-                                // Only send if we have images (capture might return empty event if no changes)
-                                // But CaptureEvent usually contains whatever was captured.
-                                // The capture() method returns a Result<CaptureEvent>.
+                            Ok(event) => {
+                                info!("TimerCaptureProducer: captured {} images", event.images.len());
                                 if tx.send(event).await.is_err() {
-                                    info!("Receiver dropped, stopping TimerScreenshotProducer");
+                                    info!("Receiver dropped, stopping TimerCaptureProducer");
                                     break;
                                 }
                             }
-                            Ok(Err(e)) => {
-                                error!("Failed to capture screenshot: {:?}", e);
-                            }
                             Err(e) => {
-                                error!("Failed to create capture task: {:?}", e);
+                                error!("Failed to spawn capture task: {:?}", e);
                             }
                         }
                     }
                 }
             }
+            info!("TimerCaptureProducer finished");
         });
 
         Ok(handler)

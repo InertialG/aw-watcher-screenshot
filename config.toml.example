@@ -27,4 +27,4 @@ region = "auto"
 # key_prefix = "screenshots/"
 
 [aw_server]
-enabled = true
+pulse_time = 60.0
