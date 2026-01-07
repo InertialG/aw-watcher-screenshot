@@ -1,11 +1,13 @@
 mod config;
 mod event;
-mod trigger;
+mod screenshot;
 mod worker;
 mod worker_impl;
 
 use crate::event::{AwEvent, CaptureCommand, CaptureEvent, CompleteCommand, ImageEvent};
+use crate::worker::TaskProcessor;
 use anyhow::{Error, Result};
+use async_trait::async_trait;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -20,6 +22,17 @@ struct Args {
     /// Path to configuration file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+}
+
+/// Drain processor - consumes events at the end of the pipeline
+struct DrainProcessor;
+
+#[async_trait]
+impl TaskProcessor<CompleteCommand, ()> for DrainProcessor {
+    async fn consume(&mut self, _event: CompleteCommand) -> Result<(), Error> {
+        // Just drain, do nothing
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -57,84 +70,71 @@ async fn main() -> Result<(), Error> {
 
     info!("Config loaded, aw_server: {:?}", config.aw_server);
 
+    // Create processors
+    let trigger_interval = Duration::from_secs(config.trigger.interval_secs);
+    let trigger_timeout = config.trigger.timeout_secs.map(Duration::from_secs);
+    let mut trigger = trigger::TimerTrigger::new(trigger_interval);
+    if let Some(t) = trigger_timeout {
+        trigger = trigger.with_timeout(t);
+    }
+
     let capture_processor = worker_impl::capture::CaptureProcessor::new(config.capture.clone())?;
     let cache_processor = worker_impl::cache::ToWebpProcessor::new(config.cache.clone());
     let s3_processor = worker_impl::s3::S3Processor::new(config.s3.clone());
-    let processor = worker_impl::awserver::AwServerProcessor::new(config.aw_server.clone());
+    let aw_processor = worker_impl::awserver::AwServerProcessor::new(config.aw_server.clone());
+    let drain_processor = DrainProcessor;
 
-    let (tx0, rx0) = mpsc::channel::<CaptureCommand>(5);
+    // Unbounded channel between trigger and capture (trigger must never block)
+    let (tx0, rx0) = mpsc::unbounded_channel::<CaptureCommand>();
     let (tx1, rx1) = mpsc::channel::<CaptureEvent>(10);
     let (tx2, rx2) = mpsc::channel::<ImageEvent>(30);
     let (tx3, rx3) = mpsc::channel::<AwEvent>(30);
     let (tx4, rx4) = mpsc::channel::<CompleteCommand>(30);
 
-    let capture_worker = worker::Worker::new("capture".to_string(), capture_processor, rx0, tx1);
-    let cache_worker = worker::Worker::new("cache".to_string(), cache_processor, rx1, tx2);
-    let s3_worker = worker::Worker::new("s3".to_string(), s3_processor, rx2, tx3);
-    let metadata_worker = worker::Worker::new("awserver".to_string(), processor, rx3, tx4);
+    // Create workers using the unified Worker architecture
+    let trigger_worker = worker::Worker::source("trigger", trigger, tx0);
+    let capture_worker = worker::Worker::new("capture", capture_processor, rx0, tx1);
+    let cache_worker = worker::Worker::new("cache", cache_processor, rx1, tx2);
+    let s3_worker = worker::Worker::new("s3", s3_processor, rx2, tx3);
+    let aw_worker = worker::Worker::new("awserver", aw_processor, rx3, tx4);
+    let drain_worker = worker::Worker::sink("drain", drain_processor, rx4);
 
-    let aw_handler = metadata_worker.start();
-    let s3_handler = s3_worker.start();
+    // Start all workers
+    let trigger_handle = trigger_worker.start();
     let capture_handle = capture_worker.start();
     let cache_handle = cache_worker.start();
-
-    let trigger_interval = Duration::from_secs(config.trigger.interval_secs);
-    let trigger_timeout = config.trigger.timeout_secs.map(Duration::from_secs);
-
-    let mut trigger = trigger::TimerTrigger::new(trigger_interval, tx0);
-    if let Some(t) = trigger_timeout {
-        trigger = trigger.with_timeout(t);
-    }
-    let periodic_task = tokio::spawn(async move {
-        if let Err(e) = trigger.run().await {
-            error!("Trigger failed: {}", e);
-        }
-    });
-
-    // Drain the final output channel to prevent backpressure
-    let drain_handle = tokio::spawn(async move {
-        let mut rx4 = rx4;
-        while let Some(_) = rx4.recv().await {
-            // drain
-        }
-        info!("Drain handler stopped.");
-    });
+    let s3_handle = s3_worker.start();
+    let aw_handle = aw_worker.start();
+    let drain_handle = drain_worker.start();
 
     // Wait for all tasks to complete
-    let (capture_result, cache_result, s3_result, aw_result, periodic_result, drain_result) = tokio::join!(
+    let (trigger_result, capture_result, cache_result, s3_result, aw_result, drain_result) = tokio::join!(
+        trigger_handle,
         capture_handle,
         cache_handle,
-        s3_handler,
-        aw_handler,
-        periodic_task,
+        s3_handle,
+        aw_handle,
         drain_handle
     );
 
-    let results = (
-        capture_result,
-        cache_result,
-        s3_result,
-        aw_result,
-        periodic_result,
-        drain_result,
-    );
-    if let Err(e) = results.0 {
+    if let Err(e) = trigger_result {
+        error!("Trigger worker joined with error: {}", e);
+    }
+    if let Err(e) = capture_result {
         error!("Capture worker joined with error: {}", e);
     }
-    if let Err(e) = results.1 {
+    if let Err(e) = cache_result {
         error!("ToWebp worker joined with error: {}", e);
     }
-    if let Err(e) = results.2 {
+    if let Err(e) = s3_result {
         error!("S3 worker joined with error: {}", e);
     }
-    if let Err(e) = results.3 {
+    if let Err(e) = aw_result {
         error!("AWServer worker joined with error: {}", e);
     }
-    if let Err(e) = results.4 {
-        error!("Periodic task joined with error: {}", e);
+    if let Err(e) = drain_result {
+        error!("Drain worker joined with error: {}", e);
     }
-    if let Err(e) = results.5 {
-        error!("Drain handler joined with error: {}", e);
-    }
+
     Ok(())
 }

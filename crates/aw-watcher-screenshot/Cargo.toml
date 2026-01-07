@@ -24,4 +24,5 @@ reqwest = { workspace = true }
 hostname = "0.4"
 aw-client-lite = { path = "../aw-client-lite" }
 aw-models = { workspace = true }
+tokio-util = "0.7.18"
 

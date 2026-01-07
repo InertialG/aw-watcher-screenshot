@@ -136,7 +136,7 @@ impl ImageEvent {
     ) -> (AwEvent, HashMap<u32, Arc<ImageInfo<WebpImage>>>) {
         let timestamp = self.timestamp;
         let path_subdir = self.get_path_subdir();
-        let mut aw_event = AwEvent::new(timestamp, self.local_dir, s3_info);
+        let mut aw_event = AwEvent::new(timestamp, self.local_dir, Some(s3_info));
         let mut datas = HashMap::new();
 
         for (key, image_info) in self.datas {
@@ -204,11 +204,15 @@ pub struct AwEvent {
     pub datas: HashMap<u32, UploadImageInfo>,
     pub timestamp: DateTime<Utc>,
     pub local_dir: PathBuf,
-    pub s3_info: UploadS3Info,
+    pub s3_info: Option<UploadS3Info>,
 }
 
 impl AwEvent {
-    pub fn new(timestamp: DateTime<Utc>, local_dir: PathBuf, s3_info: UploadS3Info) -> Self {
+    pub fn new(
+        timestamp: DateTime<Utc>,
+        local_dir: PathBuf,
+        s3_info: Option<UploadS3Info>,
+    ) -> Self {
         Self {
             datas: HashMap::new(),
             timestamp,

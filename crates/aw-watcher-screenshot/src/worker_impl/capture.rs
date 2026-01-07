@@ -1,150 +1,148 @@
-use crate::event::{CaptureCommand, CaptureEvent};
-use crate::worker::TaskProcessor;
-use anyhow::{Context, Error, Result};
+//! Timer-based screenshot processor.
+//!
+//! This module provides a `TaskProcessor` that combines timer triggering
+//! with screenshot capture functionality, producing `CaptureEvent`s on a
+//! regular interval.
+
+use crate::config::{CaptureConfig, TriggerConfig};
+use crate::event::CaptureEvent;
+use crate::screenshot::ScreenshotService;
+use crate::worker::Producer;
+use anyhow::{Error, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, TimeDelta, Utc};
-use image::{DynamicImage, imageops};
-use tracing::info;
-use xcap::Monitor;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
+use tokio::time::{self, Instant, Interval, sleep};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
-use crate::event::ImageInfo;
+/// Timer-based screenshot processor that produces `CaptureEvent`s on a schedule.
+///
+/// This processor operates in **Source mode**, meaning it has no input channel
+/// and only produces outputs. It combines the functionality of the original
+/// `TimerTrigger` and `CaptureProcessor` into a single unified processor.
+///
+/// # Example
+///
+/// ```ignore
+/// let processor = TimerScreenshotProducer::new(trigger_config, capture_config)?;
+/// let worker = Worker::source("timer_screenshot", processor, tx);
+/// worker.start();
+/// ```
+pub struct TimerScreenshotProducer {
+    screenshot_service: ScreenshotService,
+    interval: Interval,
+    timeout: Option<Duration>,
+    start_time: Option<Instant>,
 
-struct MonitorState {
-    last_dhash: Option<u64>,
-    last_time: Option<DateTime<Utc>>,
+    token: CancellationToken,
 }
 
-impl MonitorState {
-    fn new() -> Self {
-        Self {
-            last_dhash: None,
-            last_time: None,
+impl TimerScreenshotProducer {
+    /// Create a new timer-based screenshot processor.
+    ///
+    /// # Arguments
+    ///
+    /// * `trigger_config` - Configuration for timer interval and timeout
+    /// * `capture_config` - Configuration for screenshot capture (dhash threshold, etc.)
+    pub fn new(
+        trigger_config: TriggerConfig,
+        capture_config: CaptureConfig,
+        token: CancellationToken,
+    ) -> Result<Self, Error> {
+        let screenshot_service = ScreenshotService::new(capture_config)?;
+        let interval_duration = Duration::from_secs(trigger_config.interval_secs);
+        let timeout = trigger_config.timeout_secs.map(Duration::from_secs);
+
+        Ok(Self {
+            screenshot_service,
+            interval: time::interval(interval_duration),
+            timeout,
+            start_time: None,
+            token,
+        })
+    }
+
+    /// Create a new timer-based screenshot processor with just Duration values.
+    ///
+    /// This is a convenience constructor for simpler use cases.
+    pub fn with_duration(
+        interval: Duration,
+        timeout: Option<Duration>,
+        capture_config: CaptureConfig,
+        token: CancellationToken,
+    ) -> Result<Self, Error> {
+        let screenshot_service = ScreenshotService::new(capture_config)?;
+
+        Ok(Self {
+            screenshot_service,
+            interval: time::interval(interval),
+            timeout,
+            start_time: None,
+            token,
+        })
+    }
+
+    fn is_timeout_reached(&self) -> bool {
+        if let (Some(timeout), Some(start)) = (self.timeout, self.start_time) {
+            start.elapsed() >= timeout
+        } else {
+            false
         }
     }
-}
-
-use crate::config::CaptureConfig;
-
-pub struct CaptureProcessor {
-    monitor_states: Vec<ImageInfo<MonitorState>>,
-    config: CaptureConfig,
 }
 
 #[async_trait]
-impl TaskProcessor<CaptureCommand, CaptureEvent> for CaptureProcessor {
-    async fn process(&mut self, _event: CaptureCommand) -> Result<CaptureEvent, Error> {
-        let mut event = CaptureEvent::new();
+impl Producer<CaptureEvent> for TimerScreenshotProducer {
+    async fn produce(mut self, tx: Sender<CaptureEvent>) -> Result<JoinHandle<()>, Error> {
+        let handler = tokio::spawn(async move {
+            let mut timeout_future: Pin<Box<dyn Future<Output = ()> + Send>> = match self.timeout {
+                Some(duration) => Box::pin(sleep(duration)),
+                None => Box::pin(std::future::pending()),
+            };
+            let mut service = Arc::new(self.screenshot_service);
 
-        for monitor_state in &mut self.monitor_states {
-            let capture_res = capture(monitor_state.x, monitor_state.y).with_context(|| {
-                format!(
-                    "Failed to capture image from monitor {}",
-                    monitor_state.get_friendly_name()
-                )
-            })?;
-
-            if should_skip(
-                &self.config,
-                &capture_res,
-                monitor_state
-                    .payload
-                    .as_mut()
-                    .context("Monitor state not found")?,
-            ) {
-                continue;
+            loop {
+                tokio::select! {
+                    _ = self.token.cancelled() => {
+                        info!("TimerScreenshotProducer cancelled");
+                        break;
+                    }
+                    _ = timeout_future => {
+                        info!("TimerScreenshotProducer timed out");
+                        break;
+                    }
+                    _ = self.interval.tick() => {
+                        let service_cloned = Arc::clone(&service);
+                        match tokio::task::spawn_blocking(move || {
+                            let event = service_cloned.capture()?;
+                            Ok(event)
+                        }).await {
+                            Ok(Ok(event)) => {
+                                // Only send if we have images (capture might return empty event if no changes)
+                                // But CaptureEvent usually contains whatever was captured.
+                                // The capture() method returns a Result<CaptureEvent>.
+                                if tx.send(event).await.is_err() {
+                                    info!("Receiver dropped, stopping TimerScreenshotProducer");
+                                    break;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                error!("Failed to capture screenshot: {:?}", e);
+                            }
+                            Err(e) => {
+                                error!("Failed to create capture task: {:?}", e);
+                            }
+                        }
+                    }
+                }
             }
+        });
 
-            let mut image_info = ImageInfo::from_base_info(&monitor_state);
-            image_info.set_payload(capture_res);
-            event.add_image(image_info);
-        }
-
-        Ok(event)
+        Ok(handler)
     }
-}
-
-impl CaptureProcessor {
-    pub fn new(config: CaptureConfig) -> Result<Self, Error> {
-        let real_monitors = Monitor::all()?;
-        info!("Found {} monitors", real_monitors.len());
-        let mut monitor_states = Vec::new();
-        for monitor in real_monitors.iter() {
-            let mut image_info = ImageInfo::new(monitor)?;
-            image_info.set_payload(MonitorState::new());
-            monitor_states.push(image_info);
-        }
-
-        Ok(Self {
-            monitor_states,
-            config,
-        })
-    }
-}
-
-fn should_skip(
-    config: &CaptureConfig,
-    image: &DynamicImage,
-    monitor_state: &mut MonitorState,
-) -> bool {
-    let dhash = dhash(image);
-    let now = Utc::now();
-
-    if let Some(last_time) = monitor_state.last_time {
-        // Use configured force interval
-        if now - last_time > TimeDelta::try_seconds(config.force_interval_secs as i64).unwrap() {
-            monitor_state.last_dhash = Some(dhash);
-            monitor_state.last_time = Some(now);
-            return false;
-        }
-
-        // Rate limit check (keeping hardcoded small limit for safety, or could be configurable too, but 100ms is standard debounce)
-        if now - last_time < TimeDelta::try_milliseconds(100).unwrap() {
-            return true;
-        }
-    }
-
-    if let Some(last_dhash) = monitor_state.last_dhash {
-        // Use configured dhash threshold
-        if hamming_distance(dhash, last_dhash) < config.dhash_threshold {
-            return true;
-        }
-    }
-
-    monitor_state.last_dhash = Some(dhash);
-    monitor_state.last_time = Some(now);
-    false
-}
-
-fn capture(x: i32, y: i32) -> Result<DynamicImage, Error> {
-    let monitor = Monitor::from_point(x, y)?;
-    let image = monitor.capture_image()?;
-    let image = DynamicImage::ImageRgba8(image);
-    Ok(image)
-}
-
-pub fn dhash(image: &DynamicImage) -> u64 {
-    let resolution = 8;
-    let resized = imageops::resize(
-        image,
-        resolution + 1,
-        resolution,
-        imageops::FilterType::Nearest,
-    );
-    let gray = imageops::grayscale(&resized);
-
-    let mut hash = 0u64;
-    for y in 0..resolution {
-        for x in 0..resolution {
-            let left = gray.get_pixel(x, y)[0];
-            let right = gray.get_pixel(x + 1, y)[0];
-            if left < right {
-                hash |= 1 << (y * resolution + x);
-            }
-        }
-    }
-    hash
-}
-
-pub fn hamming_distance(hash1: u64, hash2: u64) -> u32 {
-    (hash1 ^ hash2).count_ones()
 }

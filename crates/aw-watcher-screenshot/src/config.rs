@@ -25,16 +25,21 @@ pub struct CaptureConfig {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct CacheConfig {
     pub cache_dir: String,
     /// WebP quality (1-100). Use 100 for lossless, lower values for lossy compression.
     /// Default is 75 which provides good balance between quality and file size.
-    #[serde(default = "default_webp_quality")]
     pub webp_quality: u8,
 }
 
-fn default_webp_quality() -> u8 {
-    75
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            cache_dir: "cache".to_string(),
+            webp_quality: 75,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

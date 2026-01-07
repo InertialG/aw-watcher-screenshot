@@ -1,100 +1,32 @@
 use anyhow::{Error, Result};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::{error, info};
-
-pub struct Worker<P, I, O> {
-    name: String,
-    processor: P,
-    rx: Receiver<I>,
-    tx: Sender<O>,
-}
 
 #[async_trait]
-pub trait TaskProcessor<I, O>: Send
+pub trait Processor<I, O>: Send
 where
-    I: Send,
-    O: Send,
-{
-    async fn process(&mut self, event: I) -> Result<O, Error>;
-
-    async fn init(&mut self) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-impl<P, I, O> Worker<P, I, O>
-where
-    P: TaskProcessor<I, O> + Send + 'static,
     I: Send + 'static,
     O: Send + 'static,
 {
-    pub fn new(name: String, processor: P, rx: Receiver<I>, tx: Sender<O>) -> Self {
-        Self {
-            name,
-            processor,
-            rx,
-            tx,
-        }
-    }
-
-    pub fn start(mut self) -> JoinHandle<()> {
-        let name = self.name.clone();
-
-        let handle = tokio::spawn(async move {
-            let ensure_clean_exit = AtomicBool::new(false);
-            let name_guard = name.clone();
-            let _guard = CallOnDrop::new(|| {
-                if !ensure_clean_exit.load(Ordering::SeqCst) {
-                    error!("Worker {} died unexpectedly! (Panic or Abort)", name_guard);
-                } else {
-                    info!("Worker {} stopped gracefully.", name_guard);
-                }
-            });
-
-            // Initialize asynchronously
-            if let Err(e) = self.processor.init().await {
-                error!("Worker {} init failed: {:?}", name, e);
-                return;
-            }
-            info!("Worker {} initialized successfully.", name);
-
-            info!("Worker {} started.", name);
-
-            while let Some(event) = self.rx.recv().await {
-                match self.processor.process(event).await {
-                    Ok(result) => {
-                        if self.tx.send(result).await.is_err() {
-                            error!("Worker {} downstream closed, stopping.", name);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Worker {} process failed: {:?}", name, e);
-                        continue;
-                    }
-                }
-            }
-            info!("Worker {} stopped.", name);
-            ensure_clean_exit.store(true, Ordering::SeqCst);
-        });
-
-        handle
-    }
+    /// Process an input event and produce an output (Transformer mode)
+    async fn process(self, rx: Receiver<I>, tx: Sender<O>) -> Result<JoinHandle<()>, Error>;
 }
 
-struct CallOnDrop<F: FnOnce()>(Option<F>);
-impl<F: FnOnce()> CallOnDrop<F> {
-    fn new(f: F) -> Self {
-        Self(Some(f))
-    }
+#[async_trait]
+pub trait Producer<O>: Send
+where
+    O: Send + 'static,
+{
+    /// Produce an output (Source mode)
+    async fn produce(self, tx: Sender<O>) -> Result<JoinHandle<()>, Error>;
 }
-impl<F: FnOnce()> Drop for CallOnDrop<F> {
-    fn drop(&mut self) {
-        if let Some(f) = self.0.take() {
-            f();
-        }
-    }
+
+#[async_trait]
+pub trait Consumer<I>: Send
+where
+    I: Send + 'static,
+{
+    /// Consume an input event (Sink mode)
+    async fn consume(self, rx: Receiver<I>) -> Result<JoinHandle<()>, Error>;
 }
