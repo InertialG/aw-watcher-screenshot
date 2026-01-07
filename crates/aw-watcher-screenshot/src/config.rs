@@ -71,6 +71,7 @@ pub struct AwServerConfig {
     pub bucket_id: String,
     pub hostname: String,
     pub timeout_secs: Option<u64>,
+    pub pulse_time: Option<f64>,
 }
 
 impl Default for AwServerConfig {
@@ -84,6 +85,7 @@ impl Default for AwServerConfig {
                 .and_then(|s| s.into_string().ok())
                 .unwrap_or_else(|| "unknown".to_string()),
             timeout_secs: Some(60),
+            pulse_time: Some(10.0),
         }
     }
 }
@@ -91,7 +93,19 @@ impl Default for AwServerConfig {
 impl Config {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path).context("Failed to read config file")?;
-        let config: Config = toml::from_str(&content).context("Failed to parse config file")?;
+        let mut config: Config = toml::from_str(&content).context("Failed to parse config file")?;
+
+        // aw的pulsetime应当比截图的触发间隔大4-5倍
+        if let Some(pulse_time) = &config.aw_server.pulse_time {
+            let trigger_interval = config.trigger.interval_secs as f64;
+            if *pulse_time < trigger_interval * 4.0 {
+                return Err(anyhow::anyhow!(
+                    "pulse_time shall be greater than trigger interval"
+                ));
+            }
+        } else {
+            config.aw_server.pulse_time = Some(config.trigger.interval_secs as f64 * 4.0);
+        }
         Ok(config)
     }
 

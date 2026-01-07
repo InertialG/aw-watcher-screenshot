@@ -2,6 +2,7 @@ use crate::config::S3Config;
 use crate::event::{AwEvent, ImageEvent, UploadS3Info};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
+use async_trait::async_trait;
 use futures::future::join_all;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
@@ -21,8 +22,9 @@ impl S3Processor {
     }
 }
 
+#[async_trait]
 impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
-    fn init(&mut self) -> Result<(), Error> {
+    async fn init(&mut self) -> Result<(), Error> {
         if !self.config.enabled {
             info!("S3 upload is disabled");
             return Ok(());
@@ -54,7 +56,7 @@ impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
         Ok(())
     }
 
-    fn process(&mut self, event: ImageEvent) -> Result<AwEvent, Error> {
+    async fn process(&mut self, event: ImageEvent) -> Result<AwEvent, Error> {
         let (aw_event, datas) = event.into_parts(UploadS3Info::new(
             self.config.endpoint.clone(),
             self.config.bucket.clone(),
@@ -71,8 +73,7 @@ impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
             return Ok(aw_event);
         };
 
-        let runtime_handle = tokio::runtime::Handle::current();
-        runtime_handle.block_on(async {
+        {
             let mut upload_futures = Vec::new();
 
             for (key, data) in datas {
@@ -119,7 +120,7 @@ impl TaskProcessor<ImageEvent, AwEvent> for S3Processor {
                     }
                 }
             }
-        });
+        }
 
         Ok(aw_event)
     }

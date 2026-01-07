@@ -1,6 +1,7 @@
 use crate::event::{CaptureCommand, CaptureEvent};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use image::{DynamicImage, imageops};
 use tracing::info;
@@ -29,8 +30,9 @@ pub struct CaptureProcessor {
     config: CaptureConfig,
 }
 
+#[async_trait]
 impl TaskProcessor<CaptureCommand, CaptureEvent> for CaptureProcessor {
-    fn process(&mut self, _event: CaptureCommand) -> Result<CaptureEvent, Error> {
+    async fn process(&mut self, _event: CaptureCommand) -> Result<CaptureEvent, Error> {
         let mut event = CaptureEvent::new();
 
         for monitor_state in &mut self.monitor_states {

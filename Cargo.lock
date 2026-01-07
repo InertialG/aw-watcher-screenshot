@@ -375,6 +375,7 @@ name = "aw-watcher-screenshot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aw-client-lite",
  "aw-models",
  "chrono",

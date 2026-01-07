@@ -1,9 +1,9 @@
 use crate::event::{CaptureEvent, ImageEvent, ImageInfo};
 use crate::worker::TaskProcessor;
 use anyhow::{Context, Error, Result};
+use async_trait::async_trait;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use webp::Encoder;
 
 pub struct ToWebpProcessor {
@@ -11,8 +11,9 @@ pub struct ToWebpProcessor {
     webp_quality: f32,
 }
 
+#[async_trait]
 impl TaskProcessor<CaptureEvent, ImageEvent> for ToWebpProcessor {
-    fn init(&mut self) -> Result<(), Error> {
+    async fn init(&mut self) -> Result<(), Error> {
         let cache_path = if let Some(ref path) = self.cache_path {
             path.clone()
         } else {
@@ -26,7 +27,7 @@ impl TaskProcessor<CaptureEvent, ImageEvent> for ToWebpProcessor {
         Ok(())
     }
 
-    fn process(&mut self, event: CaptureEvent) -> Result<ImageEvent, Error> {
+    async fn process(&mut self, event: CaptureEvent) -> Result<ImageEvent, Error> {
         let cache_path = self
             .cache_path
             .as_ref()

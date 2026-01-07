@@ -4,18 +4,17 @@ use crate::event::{CompleteCommand, UploadImageInfo, UploadS3Info};
 use crate::worker::TaskProcessor;
 use crate::{config::AwServerConfig, event::AwEvent};
 use anyhow::{Context, Error, Result};
+use async_trait::async_trait;
 use aw_client_lite::AwClient;
 use aw_models::Event;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Map, Value};
-use tokio::runtime::Handle;
 use tracing::info;
 
 pub struct AwServerProcessor {
     config: AwServerConfig,
     client: Option<AwClient>,
     bucket_id: Option<String>,
-    handle: Handle,
 
     timeout: Duration,
     last_datas: Option<AwEvent>,
@@ -29,29 +28,30 @@ impl AwServerProcessor {
             config,
             client: None,
             bucket_id: None,
-            handle: Handle::current(),
             timeout: Duration::seconds(timeout as i64),
             last_datas: None,
             last_timestamp: None,
         }
     }
 
-    fn heartbeat_data(&self, upload: &Event, pulse_time: f64) -> Result<(), Error> {
+    async fn heartbeat_data(&self, upload: &Event, pulse_time: f64) -> Result<(), Error> {
         let Some(bucket_id) = &self.bucket_id else {
             return Err(anyhow::anyhow!("Bucket ID not initialized"));
         };
         let Some(client) = &self.client else {
             return Err(anyhow::anyhow!("Client not initialized"));
         };
-        self.handle
-            .block_on(client.heartbeat(bucket_id, upload, pulse_time))
+        client
+            .heartbeat(bucket_id, upload, pulse_time)
+            .await
             .context("Failed to send heartbeat")?;
         Ok(())
     }
 }
 
+#[async_trait]
 impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
-    fn init(&mut self) -> Result<(), Error> {
+    async fn init(&mut self) -> Result<(), Error> {
         let client = AwClient::new(&self.config.host, self.config.port);
 
         let bucket_id = format!("{}_{}", self.config.bucket_id, self.config.hostname);
@@ -63,8 +63,9 @@ impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
             "type": "uno.guan810.screenshot"
         });
 
-        self.handle
-            .block_on(client.create_bucket(&bucket))
+        client
+            .create_bucket(&bucket)
+            .await
             .context("Failed to create bucket")?;
 
         self.client = Some(client);
@@ -75,8 +76,11 @@ impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
         Ok(())
     }
 
-    fn process(&mut self, mut event: AwEvent) -> Result<CompleteCommand, Error> {
+    async fn process(&mut self, mut event: AwEvent) -> Result<CompleteCommand, Error> {
         let timestamp = event.timestamp;
+        let Some(pulse_time) = self.config.pulse_time else {
+            return Err(anyhow::anyhow!("Pulse time not initialized"));
+        };
 
         let last_timestamp = self.last_timestamp.get_or_insert_with(HashMap::new);
 
@@ -92,7 +96,7 @@ impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
                 duration: Duration::zero(),
                 data: create_heartbeat_data(&last_heartbeat),
             };
-            self.heartbeat_data(&heart_beat, 10.0)?;
+            self.heartbeat_data(&heart_beat, pulse_time).await?;
             return Ok(true);
         }
 
@@ -125,7 +129,7 @@ impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
                 duration: Duration::zero(),
                 data: create_heartbeat_data(&last_datas),
             };
-            self.heartbeat_data(&finish, 10.0)?;
+            self.heartbeat_data(&finish, pulse_time).await?;
         }
 
         let heartbeat = Event {
@@ -135,7 +139,7 @@ impl TaskProcessor<AwEvent, CompleteCommand> for AwServerProcessor {
             data: create_heartbeat_data(&event),
         };
 
-        self.heartbeat_data(&heartbeat, 10.0)?;
+        self.heartbeat_data(&heartbeat, pulse_time).await?;
 
         self.last_datas = Some(event);
         Ok(true)

@@ -1,4 +1,5 @@
 use anyhow::{Error, Result};
+use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
@@ -11,10 +12,15 @@ pub struct Worker<P, I, O> {
     tx: Sender<O>,
 }
 
-pub trait TaskProcessor<I, O> {
-    fn process(&mut self, event: I) -> Result<O, Error>;
+#[async_trait]
+pub trait TaskProcessor<I, O>: Send
+where
+    I: Send,
+    O: Send,
+{
+    async fn process(&mut self, event: I) -> Result<O, Error>;
 
-    fn init(&mut self) -> Result<(), Error> {
+    async fn init(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -37,7 +43,7 @@ where
     pub fn start(mut self) -> JoinHandle<()> {
         let name = self.name.clone();
 
-        let handle = tokio::task::spawn_blocking(move || {
+        let handle = tokio::spawn(async move {
             let ensure_clean_exit = AtomicBool::new(false);
             let name_guard = name.clone();
             let _guard = CallOnDrop::new(|| {
@@ -48,8 +54,8 @@ where
                 }
             });
 
-            // Initialize inside spawn_blocking so block_on can be used
-            if let Err(e) = self.processor.init() {
+            // Initialize asynchronously
+            if let Err(e) = self.processor.init().await {
                 error!("Worker {} init failed: {:?}", name, e);
                 return;
             }
@@ -57,10 +63,10 @@ where
 
             info!("Worker {} started.", name);
 
-            while let Some(event) = self.rx.blocking_recv() {
-                match self.processor.process(event) {
+            while let Some(event) = self.rx.recv().await {
+                match self.processor.process(event).await {
                     Ok(result) => {
-                        if let Err(_) = self.tx.blocking_send(result) {
+                        if self.tx.send(result).await.is_err() {
                             error!("Worker {} downstream closed, stopping.", name);
                             break;
                         }
