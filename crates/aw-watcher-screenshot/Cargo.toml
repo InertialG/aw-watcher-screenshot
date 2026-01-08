@@ -2,6 +2,12 @@
 name = "aw-watcher-screenshot"
 version = "0.1.0"
 edition = "2024"
+authors = ["guan le <guanle@guan810.uno>"]
+description = "A comprehensive screenshot watcher for ActivityWatch"
+repository = "https://gitea.guan810.uno/rust-playbook/aw-watcher-screenshot"
+license = "MPL-2.0"
+keywords = ["activitywatch", "screenshot", "quantified-self"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = { workspace = true }

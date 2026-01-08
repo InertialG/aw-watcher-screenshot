@@ -2,6 +2,10 @@
 name = "aw-client-lite"
 version = "0.1.0"
 edition = "2024"
+authors = ["guan le <guanle@guan810.uno>"]
+description = "A lightweight ActivityWatch client for Rust"
+repository = "https://gitea.guan810.uno/rust-playbook/aw-watcher-screenshot"
+license = "MPL-2.0"
 
 [dependencies]
 anyhow.workspace = true
