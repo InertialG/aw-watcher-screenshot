@@ -56,7 +56,8 @@ jobs:
             libxcb-shm0-dev \
             libxcb-image0-dev \
             libpipewire-0.3-dev \
-            libegl-dev
+            libegl-dev \
+            libgbm-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
