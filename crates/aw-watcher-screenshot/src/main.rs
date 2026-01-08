@@ -80,7 +80,6 @@ async fn main() -> Result<(), Error> {
         worker_impl::capture::TimerCaptureProducer::new(config.trigger, cancel_token.clone())?;
     let filter_processor = worker_impl::filter::FilterProcessor::new(config.capture.clone());
     let cache_processor = worker_impl::cache::ToWebpProcessor::new(config.cache.clone())?;
-    let s3_processor = worker_impl::s3::S3Processor::new(config.s3.clone())?;
     let aw_processor =
         worker_impl::awserver::AwServerProcessor::new(config.aw_server.clone()).await?;
 
@@ -91,8 +90,19 @@ async fn main() -> Result<(), Error> {
     let filter_handle = filter_processor.process(rx_capture, tx_filter)?;
     // Processor: rx_filter -> ToWebpProcessor -> tx_cache
     let cache_handle = cache_processor.process(rx_filter, tx_cache)?;
-    // Processor: rx_cache -> S3Processor -> tx_s3
-    let s3_handle = s3_processor.process(rx_cache, tx_s3)?;
+
+    // Processor: rx_cache -> S3Processor/Passthrough -> tx_s3
+    // Use PassthroughProcessor when S3 is disabled
+    let s3_handle = if config.s3.enabled {
+        info!("S3 upload enabled, using S3Processor");
+        let s3_processor = worker_impl::s3::S3Processor::new(config.s3.clone())?;
+        s3_processor.process(rx_cache, tx_s3)?
+    } else {
+        info!("S3 upload disabled, using PassthroughProcessor");
+        let passthrough = worker_impl::passthrough::PassthroughProcessor::new();
+        passthrough.process(rx_cache, tx_s3)?
+    };
+
     // Consumer: rx_s3 -> AwServerProcessor
     let aw_handle = aw_processor.consume(rx_s3)?;
 

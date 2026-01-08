@@ -21,14 +21,6 @@ impl CaptureEvent {
         }
     }
 
-    pub fn _from_timestamp(timestamp: DateTime<Utc>) -> Self {
-        Self {
-            images: HashMap::new(),
-            monitors: HashMap::new(),
-            timestamp,
-        }
-    }
-
     pub fn add_image(
         &mut self,
         monitor_id: u32,
@@ -37,26 +29,6 @@ impl CaptureEvent {
     ) {
         self.images.insert(monitor_id, Arc::new(image_info));
         self.monitors.insert(monitor_id, monitor_info);
-    }
-
-    pub fn _remove_image(&mut self, monitor_id: u32) {
-        self.images.remove(&monitor_id);
-    }
-
-    pub fn _get_image(&self, id: u32) -> Option<Arc<DynamicImage>> {
-        self.images.get(&id).cloned()
-    }
-
-    pub fn _image_iter(&self) -> Vec<(u32, Arc<DynamicImage>)> {
-        self.images
-            .iter()
-            .map(|(k, v)| (*k, Arc::clone(v)))
-            .collect()
-    }
-
-    /// Returns the subdirectory path: {yyyy}/{mm}/{dd}/{hh}
-    pub fn _get_path_subdir(&self) -> String {
-        self.timestamp.format("%Y/%m/%d/%H").to_string()
     }
 }
 
@@ -85,10 +57,6 @@ impl ImageEvent {
 
     pub fn add_data(&mut self, monitor_id: u32, image_info: WebpImage) {
         self.datas.insert(monitor_id, Arc::new(image_info));
-    }
-
-    pub fn _get_monitor_info(&self, monitor_id: u32) -> Option<&UploadImageInfo> {
-        self.monitors.get(&monitor_id)
     }
 }
 

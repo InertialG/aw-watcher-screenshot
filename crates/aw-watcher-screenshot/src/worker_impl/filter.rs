@@ -10,8 +10,6 @@ use anyhow::{Error, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use image::{DynamicImage, imageops};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -88,13 +86,6 @@ impl FilterProcessor {
         state.last_time = Some(now);
         false
     }
-
-    /// Generate short hash for monitor identification.
-    fn _get_short_hash(name: &str, width: u32, height: u32, x: i32, y: i32) -> String {
-        let mut hasher = DefaultHasher::new();
-        (name, width, height, x, y).hash(&mut hasher);
-        format!("{:08x}", hasher.finish())
-    }
 }
 
 impl Processor<CaptureEvent, CaptureEvent> for FilterProcessor {
@@ -113,12 +104,14 @@ impl Processor<CaptureEvent, CaptureEvent> for FilterProcessor {
                 event.monitors.retain(|id, _| event.images.contains_key(id));
                 let filtered_count = event.images.len();
                 info!(
-                    "FilterProcessor: received {} images, {} passed filter",
-                    original_count, filtered_count
+                    original = original_count,
+                    passed = filtered_count,
+                    skipped = original_count - filtered_count,
+                    "Filter processed images"
                 );
 
                 if let Err(e) = tx.send(event).await {
-                    info!("FilterProcessor: receiver dropped, stopping: {}", e);
+                    info!(error = %e, "FilterProcessor: receiver dropped, stopping");
                     break;
                 }
             }

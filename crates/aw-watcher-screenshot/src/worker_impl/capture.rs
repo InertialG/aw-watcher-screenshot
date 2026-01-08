@@ -6,7 +6,7 @@
 use crate::config::TriggerConfig;
 use crate::event::{CaptureEvent, UploadImageInfo};
 use crate::worker::Producer;
-use anyhow::{Context, Error, Result};
+use anyhow::{Error, Result};
 use image::DynamicImage;
 use std::future::Future;
 use std::pin::Pin;
@@ -61,7 +61,6 @@ impl MonitorInfo {
 /// // Wire to filter processor downstream
 /// ```
 pub struct TimerCaptureProducer {
-    monitors: Vec<MonitorInfo>,
     interval: Interval,
     timeout: Option<Duration>,
     token: CancellationToken,
@@ -91,62 +90,10 @@ impl TimerCaptureProducer {
         let timeout = trigger_config.timeout_secs.map(Duration::from_secs);
 
         Ok(Self {
-            monitors,
             interval: time::interval(interval_duration),
             timeout,
             token,
         })
-    }
-
-    /// Create a new timer-based capture producer with just Duration values.
-    pub fn _with_duration(
-        interval: Duration,
-        timeout: Option<Duration>,
-        token: CancellationToken,
-    ) -> Result<Self, Error> {
-        let real_monitors = Monitor::all()?;
-        info!(
-            "TimerCaptureProducer: Found {} monitors",
-            real_monitors.len()
-        );
-
-        let mut monitors = Vec::new();
-        for monitor in real_monitors {
-            let monitor_info = MonitorInfo::new(monitor)?;
-            monitors.push(monitor_info);
-        }
-
-        Ok(Self {
-            monitors,
-            interval: time::interval(interval),
-            timeout,
-            token,
-        })
-    }
-
-    /// Capture screenshots from all monitors.
-    fn _capture_all(&self) -> Result<CaptureEvent, Error> {
-        let mut event = CaptureEvent::new();
-
-        for monitor_info in &self.monitors {
-            let capture_res =
-                capture_monitor(monitor_info.x, monitor_info.y).with_context(|| {
-                    format!(
-                        "Failed to capture image from monitor {}",
-                        monitor_info.get_friendly_name()
-                    )
-                })?;
-
-            let upload_info = UploadImageInfo::new(
-                monitor_info.get_friendly_name(),
-                monitor_info.id,
-                String::new(), // Object key will be set by filter processor
-            );
-
-            event.add_image(monitor_info.id, capture_res, upload_info);
-        }
-
-        Ok(event)
     }
 }
 
@@ -180,44 +127,61 @@ impl Producer<CaptureEvent> for TimerCaptureProducer {
                         break;
                     }
                     _ = self.interval.tick() => {
-                        // Capture in blocking task since xcap operations are blocking
-                        let monitors_clone: Vec<(i32, i32, String, u32)> = self.monitors
-                            .iter()
-                            .map(|m| (m.x, m.y, m.get_friendly_name(), m.id))
-                            .collect();
-
-                        match tokio::task::spawn_blocking(move || {
+                        // Hot-plug support: refresh monitor list each capture cycle
+                        // This handles monitors being connected/disconnected at runtime
+                        match tokio::task::spawn_blocking(|| {
+                            let monitors = Monitor::all()?;
                             let mut event = CaptureEvent::new();
-                            for (x, y, name, id) in monitors_clone {
-                                match capture_monitor(x, y) {
+
+                            for monitor in monitors {
+                                let monitor_info = match MonitorInfo::new(monitor) {
+                                    Ok(info) => info,
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to get monitor info");
+                                        continue;
+                                    }
+                                };
+
+                                match capture_monitor(monitor_info.x, monitor_info.y) {
                                     Ok(image) => {
                                         let upload_info = UploadImageInfo::new(
-                                            name,
-                                            id,
+                                            monitor_info.get_friendly_name(),
+                                            monitor_info.id,
                                             format!(
                                                 "{}/{}.webp",
                                                 event.timestamp.format("%Y/%m/%d/%H"),
-                                                format!("{}_{}", event.timestamp.format("%Y%m%d_%H%M%S%3f"), id)
+                                                format!("{}_{}", event.timestamp.format("%Y%m%d_%H%M%S%3f"), monitor_info.id)
                                             ),
                                         );
-                                        event.add_image(id, image, upload_info);
+                                        event.add_image(monitor_info.id, image, upload_info);
                                     }
                                     Err(e) => {
-                                        error!("Failed to capture monitor {}: {:?}", id, e);
+                                        error!(
+                                            monitor_id = monitor_info.id,
+                                            monitor_name = %monitor_info.get_friendly_name(),
+                                            error = %e,
+                                            "Failed to capture monitor"
+                                        );
                                     }
                                 }
                             }
-                            event
+                            Ok::<_, Error>(event)
                         }).await {
-                            Ok(event) => {
-                                info!("TimerCaptureProducer: captured {} images", event.images.len());
+                            Ok(Ok(event)) => {
+                                info!(
+                                    captured = event.images.len(),
+                                    "Captured screenshots from monitors"
+                                );
                                 if tx.send(event).await.is_err() {
                                     info!("Receiver dropped, stopping TimerCaptureProducer");
                                     break;
                                 }
                             }
+                            Ok(Err(e)) => {
+                                error!(error = %e, "Failed to enumerate monitors");
+                            }
                             Err(e) => {
-                                error!("Failed to spawn capture task: {:?}", e);
+                                error!(error = %e, "Failed to spawn capture task");
                             }
                         }
                     }

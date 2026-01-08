@@ -2,9 +2,9 @@ use crate::event::{CaptureEvent, ImageEvent};
 use crate::worker::Processor;
 use anyhow::{Error, Result};
 use futures::future::join_all;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::fs;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -31,11 +31,10 @@ impl Processor<CaptureEvent, ImageEvent> for ToWebpProcessor {
                 // Compute cache path based on event timestamp
                 let cache_path = cache_dir.join(event.timestamp.format("%Y/%m/%d/%H").to_string());
 
-                if !cache_path.exists() {
-                    if let Err(e) = fs::create_dir_all(&cache_path) {
-                        error!("Failed to create cache directory: {}", e);
-                        continue;
-                    }
+                // Create directory asynchronously
+                if let Err(e) = fs::create_dir_all(&cache_path).await {
+                    error!(path = %cache_path.display(), error = %e, "Failed to create cache directory");
+                    continue;
                 }
 
                 let cache_path = Arc::new(cache_path);
@@ -47,15 +46,22 @@ impl Processor<CaptureEvent, ImageEvent> for ToWebpProcessor {
                     let key = *key;
                     let timestamp = event.timestamp;
 
+                    // Use spawn_blocking for WebP encoding (Encoder is not Send due to raw pointers)
                     let cache_task = async move {
-                        let encoder = Encoder::from_image(&*image_data)
-                            .map_err(|e| anyhow::anyhow!("Failed to create WebP encoder: {}", e))?;
+                        let webp_vec = tokio::task::spawn_blocking(move || {
+                            let encoder = Encoder::from_image(&*image_data).map_err(|e| {
+                                anyhow::anyhow!("Failed to create WebP encoder: {}", e)
+                            })?;
 
-                        let webp_data = if webp_quality >= 100.0 {
-                            encoder.encode_lossless()
-                        } else {
-                            encoder.encode(webp_quality)
-                        };
+                            let webp_data = if webp_quality >= 100.0 {
+                                encoder.encode_lossless()
+                            } else {
+                                encoder.encode(webp_quality)
+                            };
+
+                            Ok::<_, Error>(webp_data.to_vec())
+                        })
+                        .await??;
 
                         let file_path = cache_path.join(format!(
                             "{}_{}.webp",
@@ -63,10 +69,11 @@ impl Processor<CaptureEvent, ImageEvent> for ToWebpProcessor {
                             key
                         ));
 
-                        fs::write(&file_path, &*webp_data)?;
-                        info!("ToWebpProcessor: saved {}", file_path.display());
+                        // Async file write
+                        fs::write(&file_path, &webp_vec).await?;
+                        info!(path = %file_path.display(), size_bytes = webp_vec.len(), "Saved WebP image");
 
-                        Ok::<_, Error>((key, webp_data.to_vec()))
+                        Ok::<_, Error>((key, webp_vec))
                     };
 
                     cache_futures.push(cache_task);
@@ -100,9 +107,8 @@ impl ToWebpProcessor {
     pub fn new(config: CacheConfig) -> Result<Self, Error> {
         let cache_dir = PathBuf::from(config.cache_dir);
 
-        if !cache_dir.exists() {
-            fs::create_dir_all(&cache_dir)?;
-        }
+        // Note: Directory creation is done asynchronously during processing
+        // Initial directory will be created on first use
         Ok(Self {
             cache_dir,
             webp_quality: config.webp_quality as f32,

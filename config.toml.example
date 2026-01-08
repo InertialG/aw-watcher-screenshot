@@ -12,9 +12,6 @@ cache_dir = "test_cache"
 # 75 is a good balance between quality and speed/size.
 webp_quality = 75
 
-[sqlite]
-db_path = "test_db.sqlite"
-
 # S3 / Object Storage configuration (optional)
 # Set enabled = true and fill in your credentials to enable upload
 [s3]
@@ -27,4 +24,8 @@ region = "auto"
 # key_prefix = "screenshots/"
 
 [aw_server]
+# pulse_time should be at least 4x the trigger interval_secs
+# This ensures continuous heartbeat events in ActivityWatch
+# For interval_secs = 2, pulse_time >= 8.0 is recommended
 pulse_time = 60.0
+
