@@ -57,7 +57,7 @@ jobs:
             libxcb-image0-dev \
             libx11-dev \
             libdbus-1-dev \
-            libpipewire
+            libpipewire-0.3-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
